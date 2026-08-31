@@ -1,0 +1,1224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lift Tracker Feedback Desk</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128221;</text></svg>">
+<meta name="apple-mobile-web-app-title" content="Feedback">
+<meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1a17" media="(prefers-color-scheme: dark)">
+<!--
+  Lift Tracker Feedback Desk — capture feedback about the apps in this repo, triage it, and hand a
+  batch of it to a Claude agent as a work order.
+
+  Sibling to Lift Tracker: same single-file, no-build-step, LAN-server shape, same visual
+  language. The difference is the storage. Every item is a markdown file with frontmatter
+  in feedback-desk/data/items/, so an agent reads and edits them directly and the browser
+  is just one of two peers editing the same files. See serve_feedback_desk.py.
+-->
+<style>
+  :root {
+    --bg: #f7f6f3; --panel: #ffffff; --panel-2: #fbfaf7; --border: #ddd8ce;
+    --text: #2b2822; --muted: #7a7568; --faint: #a6a094;
+    --accent: #7a5c3e; --accent-bg: #f0e6d8;
+    --ok: #2f6e4f; --ok-bg: #e2f3e8;
+    --warn: #a3540f; --warn-bg: #fbe9d4;
+    --bad: #a3311f; --bad-bg: #fbe0dc;
+    --info: #2a6f97; --info-bg: #dcedf7;
+    --input-bg: #ffffff;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 12px rgba(0,0,0,.05);
+    /* Low severity gets a green of its own, and `question` a dark yellow, so neither
+       borrows a status colour that means something else. Free-text tags deliberately keep
+       the plain chip greys: they're labels, not a judgement, and colouring them would
+       compete with the fields that are. */
+    --sev-low-fg: #2f6e4f; --sev-low-bg: #e4f2ea;
+    --q-fg: #7a6410; --q-bg: #f7efd6;
+    --st-backlog-fg: #6f6a5c; --st-backlog-bg: #efece3;
+    --st-queued-fg: #6d4c9b; --st-queued-bg: #eee7f8;
+    --st-done-fg: #2f6e4f;   --st-done-bg: #e2f3e8;
+    --st-closed-fg: #8c8578; --st-closed-bg: #eceae4;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1a17; --panel: #26231f; --panel-2: #2b2823; --border: #3c382f;
+      --text: #ece7dc; --muted: #a39b89; --faint: #837b6c;
+      --accent: #d8b78a; --accent-bg: #3a2f22;
+      --ok: #7fcf9f; --ok-bg: #1e3327;
+      --warn: #e0a355; --warn-bg: #3d2f1c;
+      --bad: #e07a68; --bad-bg: #3c2320;
+      --info: #7ec8e3; --info-bg: #1a2e38;
+      --input-bg: #201d19;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 12px rgba(0,0,0,.25);
+      --sev-low-fg: #7fcf9f; --sev-low-bg: #1d3226;
+      --q-fg: #d9bd63; --q-bg: #332c14;
+      --st-backlog-fg: #a39b89; --st-backlog-bg: #2a2721;
+      --st-queued-fg: #b79ae0; --st-queued-bg: #262032;
+      --st-done-fg: #7fcf9f;   --st-done-bg: #1e3327;
+      --st-closed-fg: #8a8375; --st-closed-bg: #292620;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: .5rem; padding: .4rem .7rem;
+    border-bottom: 1px solid var(--border); background: var(--panel); flex: none; flex-wrap: wrap;
+  }
+  header h1 { font-size: .95rem; margin: 0 .4rem 0 0; font-weight: 650; }
+  .spacer { flex: 1; }
+  .pill { font-size: .7rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap;
+    border: 1px solid var(--border); color: var(--muted); }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
+
+  button { font: inherit; padding: .3rem .65rem; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; border-color: var(--border); }
+  button.primary { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button.small { padding: .15rem .45rem; font-size: .75rem; }
+  button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  button.ghost:hover { border-color: var(--border); color: var(--text); }
+  button.danger { color: var(--bad); }
+  button.danger:hover { border-color: var(--bad); background: var(--bad-bg); }
+  .tabs { display: flex; gap: .2rem; flex-wrap: wrap; min-width: 0; }
+  .tabs button.active { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+  input, select, textarea { font: inherit; padding: .25rem .4rem; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--input-bg); color: var(--text); max-width: 100%; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea { resize: vertical; width: 100%; font-family: inherit; }
+  label.field { display: flex; flex-direction: column; gap: .15rem; font-size: .72rem; color: var(--muted); }
+  label.field > * { font-size: .85rem; }
+
+  #filters { display: flex; gap: .35rem; align-items: center; padding: .35rem .7rem; flex: none;
+    border-bottom: 1px solid var(--border); background: var(--panel-2); overflow-x: auto; white-space: nowrap; }
+  #filters select, #filters input { font-size: .78rem; padding: .2rem .35rem; }
+  #f-q { min-width: 12rem; }
+  #filter-count { font-size: .72rem; color: var(--faint); margin-left: auto; padding-left: .5rem; }
+
+  main { flex: 1; min-height: 0; overflow: auto; padding: .7rem; }
+  .empty { color: var(--muted); font-size: .85rem; padding: 2rem; text-align: center; }
+  h2.section { font-size: .8rem; margin: 0 0 .4rem; font-weight: 650; letter-spacing: .03em;
+    text-transform: uppercase; color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: .7rem; }
+
+  /* capture form */
+  #capture { margin-bottom: .7rem; }
+  #capture summary { cursor: pointer; font-weight: 650; font-size: .88rem; padding: .2rem 0; list-style: none; }
+  #capture summary::-webkit-details-marker { display: none; }
+  #capture summary::before { content: "＋ "; color: var(--accent); }
+  #capture[open] summary::before { content: "− "; }
+  .cap-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .45rem; margin: .5rem 0; }
+  .cap-full { display: flex; flex-direction: column; gap: .45rem; }
+  .cap-actions { display: flex; gap: .4rem; align-items: center; margin-top: .5rem; }
+
+  /* board */
+  #board { display: flex; gap: .6rem; align-items: flex-start; }
+  .col { flex: 1 1 0; min-width: 200px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: .45rem; }
+  .col.drag-over { border-color: var(--accent); background: var(--accent-bg); }
+  .col-head { display: flex; align-items: center; gap: .35rem; font-size: .76rem; font-weight: 650;
+    text-transform: uppercase; letter-spacing: .03em; margin-bottom: .45rem; }
+  .col-count { font-weight: 400; color: var(--faint); }
+  .col-body { min-height: 2.5rem; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: .4rem .5rem; margin-bottom: .4rem; cursor: pointer; box-shadow: var(--shadow);
+    border-left: 3px solid var(--border); }
+  .card:hover { border-color: var(--accent); }
+  .card.sev-high { border-left-color: var(--warn); }
+  .card.sev-low { border-left-color: transparent; }
+  .card.picked { outline: 2px solid var(--accent); }
+  .card-top { display: flex; gap: .4rem; align-items: flex-start; }
+  .card-top input[type=checkbox] { margin-top: .25rem; flex: none; }
+  .card-id { font-family: var(--mono); font-size: .68rem; color: var(--faint); }
+  .card-title { font-weight: 600; font-size: .85rem; word-break: break-word; }
+  /* align-items keeps one unusually tall chip from stretching its neighbours into ovals;
+     flex:none keeps a crowded row from squeezing them narrower than their text. */
+  .chips { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .3rem; align-items: flex-start; }
+  .chip { font-size: .67rem; padding: .08rem .4rem; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted); background: var(--panel-2); white-space: nowrap; flex: none; }
+  .chip.type-bug { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
+  .chip.type-feature { color: var(--info); background: var(--info-bg); border-color: var(--info); }
+  .chip.type-polish { color: var(--accent); background: var(--accent-bg); border-color: var(--accent); }
+  .chip.type-question { color: var(--q-fg); background: var(--q-bg); border-color: var(--q-fg); }
+  /* .chip.tag takes the base chip greys above — no rule of its own, by design. */
+  .chip.sev { font-weight: 600; }
+  .chip.sev-high { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); }
+  .chip.sev-low { color: var(--sev-low-fg); background: var(--sev-low-bg); border-color: var(--sev-low-fg); }
+  .chip.brief { font-family: var(--mono); color: var(--st-queued-fg); background: var(--st-queued-bg); border-color: var(--st-queued-fg); }
+  .st-backlog { color: var(--st-backlog-fg); background: var(--st-backlog-bg); border-color: var(--st-backlog-fg); }
+  .st-queued { color: var(--st-queued-fg); background: var(--st-queued-bg); border-color: var(--st-queued-fg); }
+  .st-done { color: var(--st-done-fg); background: var(--st-done-bg); border-color: var(--st-done-fg); }
+  .st-closed { color: var(--st-closed-fg); background: var(--st-closed-bg); border-color: var(--st-closed-fg); }
+
+  /* list */
+  .row { display: flex; align-items: center; gap: .5rem; padding: .35rem .4rem; cursor: pointer;
+    border-radius: 6px; border-bottom: 1px solid var(--border); }
+  .row:hover { background: var(--accent-bg); }
+  .row .card-title { flex: 1; min-width: 8rem; }
+  .row .chips { margin-top: 0; flex: none; }
+
+  /* work orders. Named .brief-card, not .brief: a chip elsewhere carries a .brief
+     modifier, and a bare .brief container rule would also match it -- which it once did,
+     applying container padding to a chip and stretching every chip beside it into an
+     oval. Keep container and modifier class names distinct. */
+  .brief-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: .6rem .7rem; margin-bottom: .6rem; }
+  .brief-card h3 { margin: 0 0 .2rem; font-size: .92rem; }
+  .pathbox { display: flex; gap: .4rem; align-items: center; margin: .45rem 0; }
+  .pathbox code { flex: 1; font-family: var(--mono); font-size: .76rem; background: var(--panel-2);
+    padding: .3rem .45rem; border-radius: 6px; border: 1px solid var(--border);
+    overflow-x: auto; white-space: nowrap; }
+  code { font-family: var(--mono); font-size: .9em; background: var(--panel-2);
+    padding: .05rem .25rem; border-radius: 4px; }
+  .hint { font-size: .75rem; color: var(--muted); }
+  .bar { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden;
+    max-width: 14rem; margin: .35rem 0; }
+  .bar > div { height: 100%; background: var(--ok); }
+
+  /* work-order editor */
+  .brief-editor { margin-top: .6rem; padding-top: .55rem; border-top: 1px solid var(--border); }
+  .be-list { max-height: 17rem; overflow-y: auto; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--panel-2); }
+  .be-row { display: flex; align-items: center; gap: .5rem; padding: .3rem .45rem;
+    border-bottom: 1px solid var(--border); font-size: .82rem; cursor: pointer; }
+  .be-row:last-child { border-bottom: none; }
+  .be-row:hover { background: var(--accent-bg); }
+  .be-row.on { background: var(--st-queued-bg); }
+  .be-row .chips { margin-top: 0; flex: none; }
+  .be-actions { display: flex; align-items: center; gap: .4rem; margin-top: .5rem; }
+  .guide { max-width: 46rem; }
+  .guide h3 { font-size: .9rem; margin: 1.1rem 0 .3rem; }
+  .guide p, .guide li { font-size: .85rem; }
+  .guide pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: .55rem .7rem; overflow-x: auto; font-family: var(--mono); font-size: .76rem; }
+  .guide ol { padding-left: 1.2rem; }
+
+  /* selection tray */
+  #tray { position: fixed; left: 50%; transform: translateX(-50%); bottom: .8rem; z-index: 30;
+    background: var(--panel); border: 1px solid var(--accent); border-radius: 999px;
+    box-shadow: var(--shadow); padding: .35rem .5rem .35rem .8rem;
+    display: flex; align-items: center; gap: .5rem; font-size: .8rem; max-width: calc(100vw - 1.5rem); }
+  #tray[hidden] { display: none; }
+
+  /* drawer + modal */
+  #scrim { position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 40; }
+  #drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 100vw); z-index: 41;
+    background: var(--panel); border-left: 1px solid var(--border); box-shadow: var(--shadow);
+    display: flex; flex-direction: column; }
+  #drawer[hidden], #scrim[hidden], #modal[hidden] { display: none; }
+  .drawer-head { display: flex; align-items: center; gap: .4rem; padding: .5rem .6rem;
+    border-bottom: 1px solid var(--border); flex: none; }
+  .drawer-head h2 { font-size: .82rem; margin: 0; flex: 1; font-family: var(--mono); color: var(--muted); }
+  .drawer-body { flex: 1; overflow-y: auto; padding: .6rem; display: flex; flex-direction: column; gap: .55rem; }
+  .drawer-foot { flex: none; padding: .45rem .6rem; border-top: 1px solid var(--border);
+    display: flex; gap: .35rem; align-items: center; }
+  #d-title { font-size: 1rem; font-weight: 650; width: 100%; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: .45rem; }
+  .drawer-body textarea[data-section] { font-size: .82rem; }
+  .resolution { font-size: .8rem; background: var(--st-done-bg); border: 1px solid var(--st-done-fg);
+    border-radius: 8px; padding: .45rem .55rem; white-space: pre-wrap; word-break: break-word;
+    color: var(--text); max-height: 16rem; overflow-y: auto; }
+  .ctx { font-family: var(--mono); font-size: .7rem; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 6px; padding: .4rem; overflow-x: auto;
+    white-space: pre-wrap; word-break: break-word; color: var(--muted); max-height: 12rem; overflow-y: auto; }
+
+  #modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
+    justify-content: center; padding: 1rem; background: rgba(0,0,0,.35); }
+  .modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--shadow); width: min(560px, 100%); max-height: 90vh; overflow-y: auto; padding: .8rem; }
+  .modal-box h3 { margin: 0 0 .5rem; font-size: .95rem; }
+  .modal-actions { display: flex; gap: .4rem; justify-content: flex-end; margin-top: .7rem; }
+  #copybox { width: 100%; min-height: 12rem; font-family: var(--mono); font-size: .72rem; }
+
+  @media (max-width: 700px) {
+    header h1 { width: 100%; margin: 0; }
+    .tabs { flex: 1 1 100%; }
+    .tabs button { flex: 1 1 auto; }
+    #board { flex-direction: column; }
+    .col { width: 100%; min-width: 0; }
+    .grid2, .grid3 { grid-template-columns: 1fr; }
+    main { padding: .5rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Lift Tracker Feedback Desk</h1>
+  <nav class="tabs" id="tabs"></nav>
+  <span class="spacer"></span>
+  <label style="font-size:.72rem;color:var(--muted)">Me:
+    <input id="me" placeholder="your name" size="8" style="font-size:.78rem"></label>
+  <span id="sync-pill" class="pill">Connecting…</span>
+</header>
+
+<div id="filters">
+  <input type="search" id="f-q" placeholder="Search feedback…" autocomplete="off">
+  <select id="f-app"></select>
+  <select id="f-area"></select>
+  <select id="f-type"></select>
+  <select id="f-sev"></select>
+  <label style="font-size:.74rem;color:var(--muted)"><input type="checkbox" id="f-closed"> Show closed</label>
+  <button class="ghost small" id="f-clear">Clear</button>
+  <span id="filter-count"></span>
+</div>
+
+<main id="view"></main>
+
+<div id="tray" hidden></div>
+<div id="scrim" hidden></div>
+<aside id="drawer" hidden aria-label="Feedback item"></aside>
+<div id="modal" hidden></div>
+
+<script>
+"use strict";
+
+const STATUSES = ["backlog", "queued", "done", "closed"];
+const STATUS_LABEL = { backlog: "Backlog", queued: "Queued", done: "Done", closed: "Closed" };
+// Finished as far as *work* goes — both count toward a work order's progress and neither
+// appears in the queue. Only `closed` is hidden by default: an item in Done is waiting on
+// a human to review it, so hiding it would strand exactly the thing that needs attention.
+const TERMINAL = new Set(["done", "closed"]);
+const HIDDEN_BY_DEFAULT = new Set(["closed"]);
+const TYPES = ["bug", "feature", "polish", "question"];
+const TYPE_LABEL = { bug: "bug", feature: "new feature", polish: "polish", question: "question" };
+const SEVERITIES = ["high", "low"];
+const SEV_RANK = { high: 0, low: 1 };
+// One box per question, mirroring SECTION_DEFS in serve_feedback_desk.py. The editor
+// writes these individually so the file's structure can't be broken by editing it.
+const SECTIONS = [
+  { key: "what", label: "What happened", rows: 4, placeholder: "What you saw." },
+  { key: "expected", label: "What you expected", rows: 3, placeholder: "What you thought would happen instead." },
+  { key: "steps", label: "Steps to reproduce", rows: 3, placeholder: "1. …" },
+  { key: "notes", label: "Notes", rows: 3, placeholder: "Anything else worth knowing." },
+];
+const VIEWS = [
+  { id: "board", label: "Board" },
+  { id: "list", label: "All items" },
+  { id: "orders", label: "Work orders" },
+  { id: "guide", label: "Guide" },
+];
+
+const state = {
+  items: [], briefs: [], meta: {}, rev: null,
+  view: "board", openId: null, picked: new Set(), editingBrief: null,
+  pending: 0, online: false,
+  filters: { q: "", app: "", area: "", type: "", severity: "", showClosed: false },
+  timers: {},
+};
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const byId = (id) => state.items.find((i) => i.id === id) || null;
+
+function setPill(kind, text) {
+  const el = $("#sync-pill");
+  el.className = "pill " + kind;
+  el.textContent = text;
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+async function apiGet(path) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return await res.json();
+}
+
+async function apiPost(path, body) {
+  state.pending++;
+  setPill("warn", "Saving…");
+  try {
+    const res = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await res.json().catch(() => ({ ok: false, error: "HTTP " + res.status }));
+    if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+    await loadState();
+    setPill("ok", "Saved " + new Date().toLocaleTimeString());
+    return data;
+  } catch (e) {
+    setPill("bad", "Save failed — " + e.message);
+    throw e;
+  } finally {
+    state.pending--;
+    render();
+  }
+}
+
+async function loadState() {
+  const body = await apiGet("/api/state");
+  state.items = body.items;
+  state.briefs = body.briefs;
+  state.meta = body.meta;
+  state.rev = body.rev;
+}
+
+// The server derives its revision from file mtimes, so this poll notices an item edited
+// on disk by an agent exactly as it notices one edited in another browser tab -- which is
+// the point: while Claude works a queue, the board updates on its own.
+async function poll() {
+  if (state.pending > 0) return;
+  try {
+    const { rev } = await apiGet("/api/rev");
+    if (rev !== state.rev) { await loadState(); render(); }
+    if (!state.online) { state.online = true; setPill("ok", "Connected"); }
+  } catch {
+    state.online = false;
+    setPill("bad", "Server unreachable");
+  }
+}
+
+const patchItem = (id, fields) => apiPost("/api/items/" + encodeURIComponent(id), fields);
+
+// ---------------------------------------------------------------------------
+// Filtering
+// ---------------------------------------------------------------------------
+function visibleItems() {
+  const f = state.filters;
+  const q = f.q.trim().toLowerCase();
+  return state.items.filter((i) => {
+    if (!f.showClosed && HIDDEN_BY_DEFAULT.has(i.status)) return false;
+    if (f.app && i.app !== f.app) return false;
+    if (f.area && i.area !== f.area) return false;
+    if (f.type && i.type !== f.type) return false;
+    if (f.severity && i.severity !== f.severity) return false;
+    if (q && ![i.id, i.title, i.body, i.area, i.app, (i.tags || []).join(" ")]
+      .join(" ").toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+function sortItems(list) {
+  // Severity is the only priority signal: a separate priority field said the same thing
+  // twice, and two rankings that can disagree is worse than one that can't.
+  return [...list].sort((a, b) =>
+    (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9) ||
+    String(b.created || "").localeCompare(String(a.created || "")));
+}
+
+const uniq = (values) => [...new Set(values.filter(Boolean))].sort();
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+function render() {
+  renderTabs();
+  renderFilterOptions();
+  const items = sortItems(visibleItems());
+  $("#filter-count").textContent = `${items.length} of ${state.items.length} items`;
+  $("#filters").style.display = (state.view === "guide" || state.view === "orders") ? "none" : "";
+  const view = $("#view");
+  const keepMain = captureFocus(view);
+  if (state.view === "board") view.innerHTML = renderBoard(items);
+  else if (state.view === "list") view.innerHTML = renderList(items);
+  else if (state.view === "orders") view.innerHTML = renderOrders();
+  else if (state.view === "guide") view.innerHTML = renderGuide();
+  if (state.view === "board") wireCapture();
+  // The orders list is rebuilt on every render, including the poll-driven ones, so the
+  // editor's text fields need the same focus/caret restoration the drawer uses.
+  if (keepMain && keepMain.sel) restoreFocus(view, keepMain);
+  renderTray();
+  renderDrawer();
+}
+
+function renderTabs() {
+  const el = $("#tabs");
+  const want = VIEWS.map((v) => {
+    const n = v.id === "board"
+      ? state.items.filter((i) => i.status === "backlog").length
+      : v.id === "orders" ? state.briefs.length : 0;
+    return `<button data-view="${v.id}"${state.view === v.id ? ' class="active"' : ""}>${v.label}${
+      n ? ` <span style="color:var(--faint)">${n}</span>` : ""}</button>`;
+  }).join("");
+  if (el.innerHTML !== want) el.innerHTML = want;
+}
+
+function typeChip(i) {
+  return `<span class="chip type-${esc(i.type)}">${esc(TYPE_LABEL[i.type] || i.type)}</span>`;
+}
+function sevChip(i) {
+  return `<span class="chip sev sev-${esc(i.severity)}">${esc(i.severity)}</span>`;
+}
+function areaLabel(i) { return [i.app, i.area].filter(Boolean).join(" / "); }
+
+function cardHTML(i, opts = {}) {
+  const area = areaLabel(i);
+  return `<article class="card sev-${esc(i.severity)}${state.picked.has(i.id) ? " picked" : ""}"
+      data-item="${esc(i.id)}" draggable="true">
+    <div class="card-top">
+      <input type="checkbox" data-pick="${esc(i.id)}"${state.picked.has(i.id) ? " checked" : ""}
+        title="Select for a work order">
+      <div style="flex:1;min-width:0">
+        <div class="card-id">${esc(i.id)}</div>
+        <div class="card-title">${esc(i.title)}</div>
+        ${area ? `<div style="font-size:.72rem;color:var(--muted)">${esc(area)}</div>` : ""}
+        <div class="chips">
+          ${opts.showStatus ? `<span class="chip st-${esc(i.status)}">${esc(STATUS_LABEL[i.status] || i.status)}</span>` : ""}
+          ${typeChip(i)}${sevChip(i)}
+          ${i.brief ? `<span class="chip brief">${esc(i.brief)}</span>` : ""}
+          ${(i.tags || []).map((t) => `<span class="chip tag">${esc(t)}</span>`).join("")}
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+function renderBoard(items) {
+  const cols = state.filters.showClosed ? STATUSES : STATUSES.filter((s) => !HIDDEN_BY_DEFAULT.has(s));
+  return captureFormHTML() + `<div id="board">` + cols.map((s) => {
+    const mine = items.filter((i) => i.status === s);
+    return `<section class="col" data-status="${s}">
+      <div class="col-head"><span class="chip st-${s}">${STATUS_LABEL[s]}</span>
+        <span class="col-count">${mine.length}</span></div>
+      <div class="col-body">${mine.map((i) => cardHTML(i)).join("") ||
+        `<div style="font-size:.75rem;color:var(--faint);padding:.4rem">Nothing here</div>`}</div>
+    </section>`;
+  }).join("") + `</div>`;
+}
+
+function renderList(items) {
+  if (!items.length) return `<div class="empty">No items match these filters.</div>`;
+  return `<div class="panel">` + items.map((i) => `
+    <div class="row" data-item="${esc(i.id)}">
+      <input type="checkbox" data-pick="${esc(i.id)}"${state.picked.has(i.id) ? " checked" : ""}>
+      <span class="card-id">${esc(i.id)}</span>
+      <span class="card-title">${esc(i.title)}</span>
+      <span class="chips">
+        <span class="chip st-${esc(i.status)}">${esc(STATUS_LABEL[i.status] || i.status)}</span>
+        ${typeChip(i)}${sevChip(i)}
+        ${i.area ? `<span class="chip">${esc(areaLabel(i))}</span>` : ""}
+        ${i.brief ? `<span class="chip brief">${esc(i.brief)}</span>` : ""}
+      </span>
+    </div>`).join("") + `</div>`;
+}
+
+function captureFormHTML() {
+  const opts = (list, sel) => list.map((v) =>
+    `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(TYPE_LABEL[v] || v)}</option>`).join("");
+  const apps = uniq([...state.items.map((i) => i.app), "lift-tracker", "feedback-desk"]);
+  const areas = uniq(state.items.map((i) => i.area));
+  return `<details class="panel" id="capture">
+    <summary>Capture feedback</summary>
+    <div class="cap-grid">
+      <label class="field">App<select id="c-app">${opts(apps, "lift-tracker")}</select></label>
+      <label class="field">Area (view or module)
+        <input id="c-area" list="area-list" placeholder="week, library…"></label>
+      <label class="field">Type<select id="c-type">${opts(TYPES, "bug")}</select></label>
+      <label class="field">Severity<select id="c-sev">${opts(SEVERITIES, "low")}</select></label>
+    </div>
+    <datalist id="area-list">${areas.map((a) => `<option value="${esc(a)}">`).join("")}</datalist>
+    <div class="cap-full">
+      <label class="field">Title — one line, the thing itself
+        <input id="c-title" placeholder="Rep boxes are too small to tap on a phone"></label>
+      <label class="field">What happened
+        <textarea id="c-what" rows="2" placeholder="What you saw."></textarea></label>
+      <label class="field">What you expected
+        <textarea id="c-expected" rows="2" placeholder="What you thought would happen instead."></textarea></label>
+      <label class="field">Steps to reproduce
+        <textarea id="c-steps" rows="2" placeholder="1. Open the week&#10;2. …"></textarea></label>
+    </div>
+    <div class="cap-actions">
+      <button class="primary" id="c-save">Capture</button>
+      <span class="hint" id="c-msg"></span>
+    </div>
+  </details>`;
+}
+
+function renderOrders() {
+  const head = `<p class="hint" style="margin-top:0">A work order is a markdown manifest: your
+    instructions, plus pointers to each item's file. Hand its path to Claude. <strong>Edit</strong>
+    changes the title, the instructions, and which items are in it — adding an item queues it,
+    removing it sends it back to Ready.</p>`;
+  if (!state.briefs.length) {
+    return head + `<div class="empty">No work orders yet. Tick some items on the Board or All
+      items tab, then use <strong>Create work order</strong>.</div>`;
+  }
+  return head + [...state.briefs].reverse().map((b) => {
+    const ids = b.items || [];
+    const done = ids.filter((id) => TERMINAL.has(byId(id)?.status)).length;
+    const editing = state.editingBrief === b.id;
+    return `<div class="brief-card">
+      <h3>${esc(b.id)} — ${esc(b.title)}</h3>
+      <div class="hint">${ids.length} item${ids.length === 1 ? "" : "s"} · ${done} closed ·
+        created ${esc((b.created || "").slice(0, 16).replace("T", " "))}</div>
+      ${ids.length ? `<div class="bar" title="${done}/${ids.length} closed">
+        <div style="width:${Math.round(done / ids.length * 100)}%"></div></div>` : ""}
+      <div class="pathbox"><code>${esc(b.path)}</code>
+        <button class="small" data-copy-path="${esc(b.path)}">Copy path</button>
+        <button class="small primary" data-copy-prompt="${esc(b.id)}">Copy prompt</button>
+        <button class="small" data-edit-brief="${esc(b.id)}">${editing ? "Done" : "Edit"}</button></div>
+      ${b.instructions ? `<p class="hint" style="white-space:pre-wrap"><strong>Instructions:</strong> ${esc(b.instructions)}</p>` : ""}
+      <div class="chips">${ids.map((id) => {
+        const it = byId(id);
+        return it ? `<span class="chip st-${esc(it.status)}" data-item="${esc(id)}"
+          style="cursor:pointer">${esc(id)} ${esc(it.title.slice(0, 40))}</span>`
+          : `<span class="chip">${esc(id)} (archived)</span>`;
+      }).join("")}</div>
+      ${editing ? briefEditorHTML(b) : ""}
+    </div>`;
+  }).join("");
+}
+
+/**
+ * Inline editor for one work order: title, instructions, and membership.
+ *
+ * Membership is a checklist of every item rather than a separate "add" flow, because the
+ * question being answered is "what's in this order", and a checklist answers it in one
+ * glance. Items already in another order are shown with that order's id, since adding one
+ * here will move it -- an item belongs to at most one order.
+ */
+function briefEditorHTML(b) {
+  const ids = b.items || [];
+  const candidates = sortItems(state.items.filter((i) =>
+    ids.includes(i.id) || !TERMINAL.has(i.status)));
+  return `<div class="brief-editor" data-editor="${esc(b.id)}">
+    <div class="grid2" style="margin-bottom:.45rem">
+      <label class="field">Title<input type="text" id="be-title" value="${esc(b.title)}"></label>
+      <label class="field">Instructions for Claude
+        <textarea id="be-notes" rows="2">${esc(b.instructions || "")}</textarea></label>
+    </div>
+    <h2 class="section">Items in this order</h2>
+    <div class="be-list">${candidates.map((i) => {
+      const inThis = ids.includes(i.id);
+      const elsewhere = i.brief && i.brief !== b.id ? i.brief : "";
+      return `<label class="be-row${inThis ? " on" : ""}">
+        <input type="checkbox" data-member="${esc(i.id)}"${inThis ? " checked" : ""}>
+        <span class="card-id">${esc(i.id)}</span>
+        <span style="flex:1;min-width:6rem">${esc(i.title)}</span>
+        <span class="chips">${typeChip(i)}${sevChip(i)}
+          ${elsewhere ? `<span class="chip brief">in ${esc(elsewhere)}</span>` : ""}</span>
+      </label>`;
+    }).join("") || `<p class="hint">No open items to add.</p>`}</div>
+    <div class="be-actions">
+      <button class="small danger" data-archive-brief="${esc(b.id)}">Archive this order</button>
+      <span style="flex:1"></span>
+      <span class="hint" id="be-msg">Changes save as you make them.</span>
+    </div>
+  </div>`;
+}
+
+function renderGuide() {
+  const dir = state.meta.itemsDir || "feedback-desk/data/items";
+  return `<div class="guide panel">
+    <h2 class="section">How this fits together</h2>
+    <p>Every item you capture becomes <strong>one markdown file with frontmatter</strong> in
+    <code>${esc(dir)}/</code>. That's the whole format. Claude reads those files directly —
+    there's no export step, and no database to interrogate.</p>
+    <pre>---
+id: fb-0001
+title: Rep boxes are too small to tap on a phone
+app: lift-tracker
+area: week
+type: bug
+severity: high
+status: backlog
+tags: ["gantt"]
+context: {"view": "week", "viewport": "390x844", "appRev": 45, "errors": []}
+---
+
+## What happened
+…
+## What I expected
+…
+## Steps to reproduce
+…</pre>
+
+    <h3>1. Capture</h3>
+    <p>Either here on the <strong>Board</strong> tab, or — better — from inside Lift Tracker
+    itself: press <code>f</code> or hit the <strong>Feedback</strong> button in its header. That
+    route attaches a <code>context</code> block automatically: which view you were on, the
+    viewport size, the browser, the app's data revision, the active filters, and any JavaScript
+    errors that had fired. That context is usually what turns "the weights are wrong" into
+    something reproducible.</p>
+
+    <h3>2. Triage</h3>
+    <p>Everything lands in <strong>Backlog</strong>. Set severity — <em>high</em> or <em>low</em>,
+    deliberately only two, because a middle option is where everything goes to avoid being
+    prioritised. It's the only ranking there is, and it orders the queue. Then pull things into a
+    work order when you want them done.</p>
+    <p>Four statuses: <strong>Backlog</strong> (the default bucket) → <strong>Queued</strong> (in a
+    work order) → <strong>Done</strong> (the agent finished) → <strong>Closed</strong> (you reviewed
+    it). That last split is the point: an agent can say it's finished, but only you can say it's
+    right. So <strong>Done is never hidden</strong>, while <strong>Closed is hidden by default</strong>
+    — nothing an agent finishes slips past unreviewed. <strong>Mark closed</strong> in the selection
+    tray signs off a batch.</p>
+
+    <h3>3. Hand a batch to Claude</h3>
+    <p>Tick the items you want done, then <strong>Create work order</strong>. That writes a file
+    to <code>${esc(state.meta.briefsDir || "feedback-desk/data/briefs")}/</code> and flips those
+    items to <strong>Queued</strong>. Then start a Claude Code session in this repo and say:</p>
+    <pre>Work on feedback-desk/data/briefs/wo-0001-….md</pre>
+    <p>The <strong>Copy prompt</strong> button on the Work orders tab puts exactly that sentence
+    on your clipboard.</p>
+    <p>A work order is a <strong>manifest, not a snapshot</strong>: its frontmatter holds the
+    title, your instructions and a list of item ids, and its body is regenerated from those on
+    every change — pointing at each item's file rather than copying its text. That's deliberate.
+    A copy would go stale the moment anyone edited an item, and hand Claude a confidently wrong
+    description.</p>
+    <p><strong>Membership is editable.</strong> Hit <strong>Edit</strong> on any work order to
+    change its title, its instructions, and which items are in it; or use <strong>Add to…</strong>
+    in the selection tray; or the work-order picker in an item's own editor. Adding an item makes
+    it <strong>Queued</strong>, removing it sends it back to <strong>Ready</strong>, and an item
+    belongs to at most one order — adding it somewhere else moves it. Archiving an order releases
+    everything in it.</p>
+
+    <h3>4. Watch it land</h3>
+    <p>Claude edits the item files as it goes — setting <code>status: done</code> and appending a
+    <code>## Resolution</code> section. This server reads the directory on every request and
+    derives its revision from file mtimes, so cards move across this board on their own while the
+    agent works. No refresh, no import.</p>
+
+    <h3>Editing an item</h3>
+    <p>The editor gives you one box per section — <em>What happened</em>, <em>What you expected</em>,
+    <em>Steps to reproduce</em>, <em>Notes</em> — rather than a raw markdown pane. Each box writes
+    only its own section, and the server rebuilds the file's structure from a known shape on every
+    save. A file someone has mangled gets straightened out rather than staying broken; loose text
+    with no heading is recovered as <em>What happened</em>; and a <code>## Resolution</code> or any
+    other section an agent adds is preserved.</p>
+
+    <h3>Working without the UI</h3>
+    <p><code>${esc((state.meta.itemsDir || "").replace("/items", ""))}/QUEUE.md</code> is a table of
+    everything open. It's the natural thing to point Claude at when you don't want to build a work
+    order — <em>"read QUEUE.md and fix the two high-severity bugs"</em> works fine. It regenerates whenever
+    the item files change, including when an agent edits them directly, so it can't drift out of
+    date behind your back.</p>
+  </div>`;
+}
+
+function renderTray() {
+  const tray = $("#tray");
+  const n = state.picked.size;
+  tray.hidden = n === 0;
+  if (!n) return;
+  // Every order is offered, including fully-closed ones: reopening work by adding to a
+  // finished order is a legitimate thing to want, and hiding them would just be confusing.
+  const orders = state.briefs;
+  tray.innerHTML = `<strong>${n}</strong> selected
+    <button class="small primary" id="tray-order">Create work order</button>
+    ${orders.length ? `<select id="tray-add" title="Add the selection to an existing work order">
+      <option value="">Add to…</option>
+      ${orders.map((b) => `<option value="${esc(b.id)}">${esc(b.id)} — ${esc(b.title)}</option>`).join("")}
+    </select>` : ""}
+    <button class="small" id="tray-close">Mark closed</button>
+    <button class="ghost small" id="tray-clear">Clear</button>`;
+  $("#tray-clear").onclick = () => { state.picked.clear(); render(); };
+  $("#tray-order").onclick = openOrderModal;
+  const addSel = $("#tray-add");
+  if (addSel) addSel.onchange = async (e) => {
+    const briefId = e.target.value;
+    if (!briefId) return;
+    const ids = [...state.picked];
+    state.picked.clear();
+    await apiPost(`/api/briefs/${encodeURIComponent(briefId)}`, { add: ids });
+    setView("orders");
+  };
+  // Reviewing a batch of finished items and signing them off is the one bulk status change
+  // worth a button -- everything else is a single-item decision.
+  $("#tray-close").onclick = async () => {
+    const ids = [...state.picked];
+    for (const id of ids) await patchItem(id, { status: "closed" });
+    state.picked.clear();
+    render();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Capture form
+// ---------------------------------------------------------------------------
+function wireCapture() {
+  const save = $("#c-save");
+  if (!save) return;
+  save.onclick = async () => {
+    const title = $("#c-title").value.trim();
+    if (!title) { $("#c-title").focus(); $("#c-msg").textContent = "A title is required."; return; }
+    const payload = {
+      title, app: $("#c-app").value, area: $("#c-area").value.trim(),
+      type: $("#c-type").value, severity: $("#c-sev").value,
+      reporter: $("#me").value.trim(),
+      what: $("#c-what").value, expected: $("#c-expected").value, steps: $("#c-steps").value,
+      context: { source: "feedback-desk", capturedAt: new Date().toISOString() },
+    };
+    const res = await apiPost("/api/capture", payload);
+    for (const id of ["c-title", "c-what", "c-expected", "c-steps"]) {
+      const el = document.getElementById(id);
+      if (el) el.value = "";
+    }
+    const msg = $("#c-msg");
+    if (msg) msg.textContent = `Captured ${res.item.id}.`;
+    const cap = $("#capture");
+    if (cap) cap.open = true;
+    document.getElementById("c-title")?.focus();
+  };
+  $("#c-title")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); save.click(); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Drawer
+// ---------------------------------------------------------------------------
+function openItem(id) { state.openId = id; renderDrawer(); }
+function closeItem() { state.openId = null; $("#drawer").hidden = true; $("#scrim").hidden = true; }
+
+function renderDrawer() {
+  const drawer = $("#drawer");
+  if (!state.openId) { drawer.hidden = true; $("#scrim").hidden = true; return; }
+  const i = byId(state.openId);
+  if (!i) { closeItem(); return; }
+  // Same focus-preserving redraw as Lift Tracker's editor: capture where the cursor was,
+  // rebuild, put it back. The poll can refresh this drawer at any moment -- including
+  // while an agent is editing the very file it's showing -- and that must not eat a
+  // half-typed sentence.
+  const keep = captureFocus(drawer);
+
+  const sel = (id, list, value) => `<select id="${id}">${list.map((v) =>
+    `<option value="${esc(v)}"${v === value ? " selected" : ""}>${esc(STATUS_LABEL[v] || TYPE_LABEL[v] || v)}</option>`).join("")}</select>`;
+  const ctx = i.context && Object.keys(i.context).length ? i.context : null;
+
+  drawer.innerHTML = `
+    <div class="drawer-head">
+      <h2>${esc(i.id)} · ${esc(i.file || "")}</h2>
+      <button class="ghost small" id="d-close" title="Close (Esc)">✕</button>
+    </div>
+    <div class="drawer-body">
+      <input type="text" id="d-title" value="${esc(i.title)}">
+      <div class="grid3">
+        <label class="field">Status${sel("d-status", STATUSES, i.status)}</label>
+        <label class="field">Type${sel("d-type", TYPES, i.type)}</label>
+        <label class="field">Severity${sel("d-sev", SEVERITIES, i.severity)}</label>
+      </div>
+      <div class="grid2">
+        <label class="field">App<input type="text" id="d-app" value="${esc(i.app || "")}"></label>
+        <label class="field">Area<input type="text" id="d-area" value="${esc(i.area || "")}"></label>
+      </div>
+      <label class="field">Tags (comma separated)
+        <input type="text" id="d-tags" value="${esc((i.tags || []).join(", "))}"></label>
+      ${SECTIONS.map((sec) => `<label class="field">${esc(sec.label)}
+        <textarea id="d-sec-${sec.key}" rows="${sec.rows}" data-section="${sec.key}"
+          placeholder="${esc(sec.placeholder)}">${esc((i.sections || {})[sec.key] || "")}</textarea></label>`).join("")}
+      ${(i.sections || {}).resolution ? `<div>
+        <h2 class="section">Resolution — written by Claude</h2>
+        <div class="resolution">${esc(i.sections.resolution)}</div></div>` : ""}
+      ${(i.extraSections || []).length ? `<div>
+        <h2 class="section">Other sections in the file</h2>
+        ${i.extraSections.map((x) => `<div class="resolution"><strong>${esc(x.heading)}</strong>
+          ${esc(x.text)}</div>`).join("")}
+        <p class="hint">Headings the desk doesn't manage. They're kept exactly as written —
+          edit them in the file itself.</p></div>` : ""}
+      ${ctx ? `<div><h2 class="section">Captured context</h2>
+        <div class="ctx">${esc(JSON.stringify(ctx, null, 2))}</div></div>` : ""}
+      <div>
+        <h2 class="section">Work order</h2>
+        <div style="display:flex;gap:.35rem;align-items:center;flex-wrap:wrap">
+          <select id="d-brief">
+            <option value="">— not in a work order —</option>
+            ${state.briefs.map((b) => `<option value="${esc(b.id)}"${
+              i.brief === b.id ? " selected" : ""}>${esc(b.id)} — ${esc(b.title)}</option>`).join("")}
+          </select>
+          ${i.brief ? `<button class="small" id="d-goto-brief">Open it</button>` : ""}
+        </div>
+        <p class="hint">An item belongs to at most one order; moving it here takes it out of
+          any other. Removing it sends it back to Ready.</p>
+      </div>
+      <p class="hint">Created ${esc((i.created || "").slice(0, 16).replace("T", " "))} ·
+        updated ${esc((i.updated || "").slice(0, 16).replace("T", " "))}
+        ${i.reporter ? " · by " + esc(i.reporter) : ""}</p>
+    </div>
+    <div class="drawer-foot">
+      <button class="small primary" id="d-copy">Copy as prompt</button>
+      <span style="flex:1"></span>
+      <button class="small danger" id="d-archive">Archive</button>
+    </div>`;
+  drawer.hidden = false;
+  $("#scrim").hidden = window.innerWidth > 700;
+  wireDrawer(i);
+  restoreFocus(drawer, keep);
+}
+
+function focusSelector(el) { return el.id ? "#" + CSS.escape(el.id) : null; }
+
+function captureFocus(root) {
+  const el = document.activeElement;
+  const body = root.querySelector(".drawer-body") || root;
+  const keep = { bodyScroll: body ? body.scrollTop : 0, sel: null };
+  if (!el || !root.contains(el)) return keep;
+  keep.sel = focusSelector(el);
+  if (!keep.sel) return keep;
+  if ("value" in el) keep.value = el.value;
+  keep.scrollTop = el.scrollTop;
+  try { keep.start = el.selectionStart; keep.end = el.selectionEnd; } catch { /* no caret */ }
+  return keep;
+}
+
+function restoreFocus(root, keep) {
+  const body = root.querySelector(".drawer-body") || root;
+  if (body && keep.bodyScroll) body.scrollTop = keep.bodyScroll;
+  if (!keep.sel) return;
+  const el = root.querySelector(keep.sel);
+  if (!el) return;
+  if (keep.value != null && "value" in el && el.value !== keep.value) el.value = keep.value;
+  el.focus({ preventScroll: true });
+  if (keep.scrollTop) el.scrollTop = keep.scrollTop;
+  if (keep.start != null && el.setSelectionRange) {
+    try { el.setSelectionRange(keep.start, keep.end); } catch { /* no caret */ }
+  }
+}
+
+function wireDrawer(i) {
+  const id = i.id;
+  const debounced = (key, fn) => (e) => {
+    clearTimeout(state.timers[key]);
+    const value = e.target.value;
+    state.timers[key] = setTimeout(() => fn(value), 600);
+  };
+  $("#d-close").onclick = closeItem;
+  $("#d-title").addEventListener("input", debounced("title", (v) => patchItem(id, { title: v })));
+  // One request per box, carrying only that section. The server merges it into the parsed
+  // file and re-renders the whole body, so the heading structure is rebuilt from a known
+  // shape on every save rather than being whatever was last typed into a raw pane.
+  for (const sec of SECTIONS) {
+    $("#d-sec-" + sec.key)?.addEventListener("input", debounced("sec:" + sec.key, (v) =>
+      patchItem(id, { sections: { [sec.key]: v } })));
+  }
+  $("#d-app").addEventListener("change", (e) => patchItem(id, { app: e.target.value.trim() }));
+  $("#d-area").addEventListener("change", (e) => patchItem(id, { area: e.target.value.trim() }));
+  $("#d-tags").addEventListener("change", (e) => patchItem(id, {
+    tags: e.target.value.split(",").map((t) => t.trim()).filter(Boolean),
+  }));
+  $("#d-status").addEventListener("change", (e) => patchItem(id, { status: e.target.value }));
+  $("#d-type").addEventListener("change", (e) => patchItem(id, { type: e.target.value }));
+  $("#d-sev").addEventListener("change", (e) => patchItem(id, { severity: e.target.value }));
+  $("#d-brief").addEventListener("change", async (e) => {
+    const target = e.target.value;
+    if (i.brief && i.brief !== target) {
+      await apiPost(`/api/briefs/${encodeURIComponent(i.brief)}`, { remove: [id] });
+    }
+    if (target) await apiPost(`/api/briefs/${encodeURIComponent(target)}`, { add: [id] });
+  });
+  $("#d-goto-brief")?.addEventListener("click", () => {
+    state.editingBrief = i.brief;
+    closeItem();
+    setView("orders");
+  });
+  $("#d-copy").onclick = () => copyText(itemPrompt(i), "Prompt for " + i.id);
+  $("#d-archive").onclick = async () => {
+    if (!confirm(`Archive ${i.id}? The file moves to data/archive/ — it isn't deleted.`)) return;
+    closeItem();
+    await apiPost(`/api/items/${encodeURIComponent(id)}/archive`, {});
+  };
+}
+
+function itemPrompt(i) {
+  return `Work on this feedback item from the Lift Tracker Feedback Desk.
+
+File: ${state.meta.itemsDir}/${i.file}
+
+When you're done, record the outcome in that file: set \`status: done\` in the frontmatter and
+append a \`## Resolution\` section saying what changed and where. Leave \`closed\` alone — that's
+the human's sign-off after reviewing your work.`;
+}
+
+// ---------------------------------------------------------------------------
+// Work order modal
+// ---------------------------------------------------------------------------
+function openOrderModal() {
+  const ids = [...state.picked];
+  const items = ids.map(byId).filter(Boolean);
+  $("#modal").hidden = false;
+  $("#modal").innerHTML = `<div class="modal-box">
+    <h3>Create work order</h3>
+    <p class="hint">${items.length} item${items.length === 1 ? "" : "s"}: ${
+      items.map((i) => esc(i.id)).join(", ")}. They'll move to <strong>Queued</strong>.</p>
+    <label class="field" style="margin-bottom:.5rem">Title
+      <input id="o-title" value="${esc(suggestOrderTitle(items))}"></label>
+    <label class="field">Anything Claude should know about this batch (optional)
+      <textarea id="o-notes" rows="4" placeholder="Do the phone ones first — I want to use it at the gym this weekend."></textarea></label>
+    <div class="modal-actions">
+      <button id="o-cancel">Cancel</button>
+      <button class="primary" id="o-create">Create</button>
+    </div>
+  </div>`;
+  $("#o-cancel").onclick = () => { $("#modal").hidden = true; };
+  $("#o-create").onclick = async () => {
+    const res = await apiPost("/api/briefs", {
+      ids, title: $("#o-title").value.trim(), instructions: $("#o-notes").value,
+    });
+    $("#modal").hidden = true;
+    state.picked.clear();
+    // setView, not a bare state.view assignment: the hash is the view's address, and
+    // leaving it stale means the URL no longer names what's on screen.
+    setView("orders");
+    copyText(briefPrompt(res.brief), "Work order " + res.brief.id + " created");
+  };
+  $("#o-title").focus();
+}
+
+function suggestOrderTitle(items) {
+  const areas = uniq(items.map((i) => i.area));
+  if (areas.length === 1) return `${areas[0]} fixes`;
+  const types = uniq(items.map((i) => i.type));
+  if (types.length === 1) return `${types[0]} batch`;
+  return "Feedback batch";
+}
+
+function briefPrompt(brief) {
+  return `Work on ${state.meta.briefsDir}/${brief.file}`;
+}
+
+// Copy, with a fallback that matters here: navigator.clipboard needs a secure context, and
+// this app is served over plain http on a LAN IP, so on a phone the modern API simply
+// isn't available. Fall back to execCommand, then to showing the text selected so it can
+// be copied by hand.
+async function copyText(text, label) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      setPill("ok", "Copied");
+      return;
+    }
+  } catch { /* fall through */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  document.body.removeChild(ta);
+  if (ok) { setPill("ok", "Copied"); return; }
+  showCopyModal(text, label);
+}
+
+function showCopyModal(text, label) {
+  $("#modal").hidden = false;
+  $("#modal").innerHTML = `<div class="modal-box">
+    <h3>${esc(label || "Copy this")}</h3>
+    <p class="hint">This browser won't let a page copy for you over plain http —
+      select the text and copy it.</p>
+    <textarea id="copybox" readonly>${esc(text)}</textarea>
+    <div class="modal-actions"><button class="primary" id="copy-close">Close</button></div>
+  </div>`;
+  const box = $("#copybox");
+  box.focus(); box.select();
+  $("#copy-close").onclick = () => { $("#modal").hidden = true; };
+}
+
+// ---------------------------------------------------------------------------
+// Filters + global wiring
+// ---------------------------------------------------------------------------
+function renderFilterOptions() {
+  const fill = (sel, list, allLabel, value) => {
+    const el = $(sel);
+    const want = `<option value="">${allLabel}</option>` +
+      list.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+    if (el.dataset.sig !== want) { el.innerHTML = want; el.dataset.sig = want; }
+    el.value = value;
+  };
+  fill("#f-app", uniq(state.items.map((i) => i.app)), "All apps", state.filters.app);
+  fill("#f-area", uniq(state.items.map((i) => i.area)), "All areas", state.filters.area);
+  fill("#f-type", TYPES, "All types", state.filters.type);
+  fill("#f-sev", SEVERITIES, "Any severity", state.filters.severity);
+}
+
+function setView(view) {
+  // "#inbox" was this view's name before Backlog replaced Inbox as the default bucket;
+  // honour the old bookmark rather than silently ignoring it.
+  if (view === "inbox") view = "board";
+  if (!VIEWS.some((v) => v.id === view)) return;
+  state.view = view;
+  localStorage.setItem("fd.view", view);
+  if (location.hash.slice(1) !== view) history.replaceState(null, "", "#" + view);
+  render();
+}
+
+function wireGlobal() {
+  $("#tabs").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-view]");
+    if (b) setView(b.dataset.view);
+  });
+  $("#scrim").onclick = closeItem;
+  $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("#modal").hidden = true; });
+  $("#me").addEventListener("change", (e) => localStorage.setItem("fd.me", e.target.value));
+
+  const setFilter = (key, value) => { state.filters[key] = value; render(); };
+  $("#f-q").addEventListener("input", (e) => {
+    clearTimeout(state.timers.q);
+    state.timers.q = setTimeout(() => setFilter("q", e.target.value), 180);
+  });
+  $("#f-app").addEventListener("change", (e) => setFilter("app", e.target.value));
+  $("#f-area").addEventListener("change", (e) => setFilter("area", e.target.value));
+  $("#f-type").addEventListener("change", (e) => setFilter("type", e.target.value));
+  $("#f-sev").addEventListener("change", (e) => setFilter("severity", e.target.value));
+  $("#f-closed").addEventListener("change", (e) => setFilter("showClosed", e.target.checked));
+  $("#f-clear").onclick = () => {
+    state.filters = { q: "", app: "", area: "", type: "", severity: "", showClosed: false };
+    $("#f-q").value = ""; $("#f-closed").checked = false;
+    render();
+  };
+
+  $("#view").addEventListener("click", (e) => {
+    const pick = e.target.closest("[data-pick]");
+    if (pick) {
+      // The checkbox is inside the card, so stop the click from also opening the drawer.
+      e.stopPropagation();
+      const id = pick.dataset.pick;
+      if (state.picked.has(id)) state.picked.delete(id); else state.picked.add(id);
+      render();
+      return;
+    }
+    const editBtn = e.target.closest("[data-edit-brief]");
+    if (editBtn) {
+      const id = editBtn.dataset.editBrief;
+      state.editingBrief = state.editingBrief === id ? null : id;
+      render();
+      return;
+    }
+    const archiveBtn = e.target.closest("[data-archive-brief]");
+    if (archiveBtn) {
+      const id = archiveBtn.dataset.archiveBrief;
+      if (!confirm(`Archive work order ${id}? Its items go back to Ready; the file moves to data/archive/.`)) return;
+      state.editingBrief = null;
+      apiPost(`/api/briefs/${encodeURIComponent(id)}/archive`, {});
+      return;
+    }
+    const member = e.target.closest("[data-member]");
+    if (member) {
+      // The checkbox lives inside a <label>, so let its own change event drive the write
+      // rather than reacting to the click twice.
+      return;
+    }
+    const copyPath = e.target.closest("[data-copy-path]");
+    if (copyPath) return copyText(copyPath.dataset.copyPath, "Work order path");
+    const copyPrompt = e.target.closest("[data-copy-prompt]");
+    if (copyPrompt) {
+      const brief = state.briefs.find((b) => b.id === copyPrompt.dataset.copyPrompt);
+      if (brief) copyText(briefPrompt(brief), "Prompt for " + brief.id);
+      return;
+    }
+    if (e.target.closest("#capture")) return;   // the capture form has its own handlers
+    const card = e.target.closest("[data-item]");
+    if (card) openItem(card.dataset.item);
+  });
+
+  // Work-order editor: membership checkboxes and the title/instructions fields. Delegated
+  // on #view because the orders list is re-rendered wholesale on every change.
+  $("#view").addEventListener("change", (e) => {
+    const editor = e.target.closest("[data-editor]");
+    if (!editor) return;
+    const briefId = editor.dataset.editor;
+    const box = e.target.closest("[data-member]");
+    if (box) {
+      const itemId = box.dataset.member;
+      apiPost(`/api/briefs/${encodeURIComponent(briefId)}`,
+        box.checked ? { add: [itemId] } : { remove: [itemId] });
+    }
+  });
+  $("#view").addEventListener("input", (e) => {
+    const editor = e.target.closest("[data-editor]");
+    if (!editor) return;
+    const briefId = editor.dataset.editor;
+    const field = e.target.id === "be-title" ? "title"
+      : e.target.id === "be-notes" ? "instructions" : null;
+    if (!field) return;
+    clearTimeout(state.timers.briefEdit);
+    const value = e.target.value;
+    state.timers.briefEdit = setTimeout(() =>
+      apiPost(`/api/briefs/${encodeURIComponent(briefId)}`, { [field]: value }), 600);
+  });
+
+  wireDnD();
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (!$("#modal").hidden) { $("#modal").hidden = true; return; }
+      if (state.openId) { closeItem(); return; }
+    }
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "")) return;
+    if (e.key === "c") {
+      e.preventDefault();
+      setView("board");
+      const cap = $("#capture");
+      if (cap) { cap.open = true; document.getElementById("c-title")?.focus(); }
+    }
+    if (e.key === "/") { e.preventDefault(); $("#f-q").focus(); }
+  });
+
+  window.addEventListener("resize", () => {
+    if (state.openId) $("#scrim").hidden = window.innerWidth > 700;
+  });
+  window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
+}
+
+function wireDnD() {
+  const view = $("#view");
+  let dragging = null;
+  view.addEventListener("dragstart", (e) => {
+    const card = e.target.closest("[data-item]");
+    if (!card) return;
+    dragging = card.dataset.item;
+    e.dataTransfer.effectAllowed = "move";
+  });
+  view.addEventListener("dragover", (e) => {
+    const col = e.target.closest(".col[data-status]");
+    if (!col || !dragging) return;
+    e.preventDefault();
+    col.classList.add("drag-over");
+  });
+  view.addEventListener("dragleave", (e) => e.target.closest(".col")?.classList.remove("drag-over"));
+  view.addEventListener("drop", async (e) => {
+    const col = e.target.closest(".col[data-status]");
+    if (!col || !dragging) return;
+    e.preventDefault();
+    col.classList.remove("drag-over");
+    const id = dragging;
+    dragging = null;
+    const item = byId(id);
+    if (item && item.status !== col.dataset.status) await patchItem(id, { status: col.dataset.status });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+async function boot() {
+  $("#me").value = localStorage.getItem("fd.me") || "";
+  const wanted = location.hash.slice(1) || localStorage.getItem("fd.view");
+  if (VIEWS.some((v) => v.id === wanted)) state.view = wanted;
+  wireGlobal();
+  try {
+    const ping = await apiGet("/api/ping");
+    if (!ping || ping.server !== "feedback-desk") throw new Error("unexpected server");
+    await loadState();
+    state.online = true;
+    setPill("ok", "Connected");
+    setView(state.view);
+  } catch (e) {
+    setPill("bad", "No server");
+    $("#view").innerHTML = `<div class="empty">
+      <p><strong>Can't reach the Lift Tracker Feedback Desk server.</strong></p>
+      <p>Run <code>./feedback-desk/server/start-server.sh</code> on the machine holding the data.</p>
+      <p style="color:var(--faint);font-size:.8rem">(${esc(e.message)})</p></div>`;
+  }
+  setInterval(poll, 4000);
+}
+
+boot();
+</script>
+</body>
+</html>
