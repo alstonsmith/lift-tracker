@@ -1,0 +1,2206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- maximum-scale=1 stops iOS Safari auto-zooming when a sub-16px input takes focus.
+     The set boxes are deliberately small (see the library-resize work); bumping them to
+     16px to dodge the zoom would undo that. iOS still honours the pinch-to-zoom
+     accessibility gesture regardless of this, so it only suppresses the focus jump. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Lift Tracker</title>
+<!-- Inline SVG favicon: gives the tab (and a phone home-screen bookmark) an icon without
+     a second request, and stops the server logging a 404 for /favicon.ico on every load. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127947;</text></svg>">
+<meta name="apple-mobile-web-app-title" content="Lift">
+<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#17191c" media="(prefers-color-scheme: dark)">
+<!--
+  Lift Tracker — one week of training at a time. Each day is either a rest day or a lift
+  day; a lift day holds exercises, and each exercise expands to the sets underneath it,
+  with the weight pre-filled from last time and an empty box for the reps you actually hit.
+
+  Single file, no build step, no dependencies. It talks to server/serve_lift_tracker.py
+  over same-origin fetch: start that server on the house machine and open the printed LAN
+  URL from any device on the WiFi. Like House Tracker (and unlike PXL's Equipment
+  Designer) there is no local-file fallback — the point is that the phone at the rack and
+  the laptop on the table are looking at the same log, and that only works via the server.
+
+  Edits go out as small per-entity operations (see mutate() below), never as a whole-file
+  save. Every device polls /api/rev every few seconds and refreshes when the number moves.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f1f3f6; --border: #d8dce3;
+    --text: #1f2328; --muted: #6b7280; --faint: #9aa1ab;
+    --accent: #2f5fd0; --accent-bg: #e4ecfd;
+    --ok: #17734b; --ok-bg: #dcf2e6;
+    --warn: #9a5b06; --warn-bg: #fbeed6;
+    --bad: #a32b1e; --bad-bg: #fbe0dc;
+    --info: #1f6f93; --info-bg: #dcecf5;
+    --input-bg: #ffffff;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 4px 12px rgba(16,24,40,.05);
+    /* Rest vs lift. Two states, so two colours, used identically on the day card's
+       header, its badge and the week strip -- a rest day reads the same everywhere. */
+    --rest-fg: #6b7280; --rest-bg: #eef0f3;
+    --lift-fg: #2f5fd0; --lift-bg: #e4ecfd;
+    --today-ring: #2f5fd0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17191c; --panel: #202327; --panel-2: #25282d; --border: #363a41;
+      --text: #e7eaee; --muted: #99a1ac; --faint: #767d88;
+      --accent: #8ab0ff; --accent-bg: #1e2a44;
+      --ok: #6fd3a1; --ok-bg: #143025;
+      --warn: #e0a355; --warn-bg: #362a18;
+      --bad: #e58575; --bad-bg: #3a221f;
+      --info: #7cc4e0; --info-bg: #152b35;
+      --input-bg: #1b1e21;
+      --shadow: 0 1px 2px rgba(0,0,0,.35), 0 4px 12px rgba(0,0,0,.3);
+      --rest-fg: #99a1ac; --rest-bg: #25282d;
+      --lift-fg: #8ab0ff; --lift-bg: #1e2a44;
+      --today-ring: #8ab0ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ---- header ---- */
+  header {
+    display: flex; align-items: center; gap: .5rem; padding: .4rem .7rem;
+    border-bottom: 1px solid var(--border); background: var(--panel); flex: none;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: .95rem; margin: 0 .4rem 0 0; font-weight: 650; letter-spacing: .01em; }
+  .spacer { flex: 1; }
+  .pill {
+    font-size: .7rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
+
+  button {
+    font: inherit; padding: .3rem .65rem; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; border-color: var(--border); }
+  button.primary { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button.small { padding: .15rem .45rem; font-size: .75rem; }
+  button.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  button.ghost:hover { border-color: var(--border); color: var(--text); }
+  button.danger { color: var(--bad); border-color: var(--border); }
+  button.danger:hover { border-color: var(--bad); background: var(--bad-bg); }
+
+  /* min-width:0 is what lets the strip wrap instead of forcing the header wider than the
+     screen -- without it a flex item floors at its max-content width and the last tabs
+     get clipped off the right edge on a phone. */
+  .tabs { display: flex; gap: .2rem; flex-wrap: wrap; min-width: 0; }
+  .tabs button.active { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+  input, select, textarea {
+    font: inherit; padding: .25rem .4rem; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--input-bg); color: var(--text); max-width: 100%;
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  label.field { display: flex; flex-direction: column; gap: .15rem; font-size: .72rem; color: var(--muted); }
+  label.field > input, label.field > select, label.field > textarea { font-size: .85rem; }
+
+  /* ---- week bar ---- */
+  #weekbar {
+    display: flex; gap: .4rem; align-items: center; padding: .35rem .7rem; flex: none;
+    border-bottom: 1px solid var(--border); background: var(--panel-2);
+    overflow-x: auto; white-space: nowrap;
+  }
+  /* display:flex above beats the hidden attribute's own display:none, so the week nav
+     has to be told to disappear explicitly — otherwise it sits there on the Library tab
+     with its label blank, offering to page a week that isn't on screen. */
+  #weekbar[hidden] { display: none; }
+  #weekbar .rangelabel { font-size: .82rem; font-weight: 600; min-width: 10.5rem; }
+  #week-summary { font-size: .72rem; color: var(--faint); margin-left: auto; padding-left: .5rem; }
+
+  /* ---- main view ---- */
+  main { flex: 1; min-height: 0; overflow: auto; padding: .7rem; }
+  .empty { color: var(--muted); font-size: .85rem; padding: 2rem; text-align: center; }
+
+  /* ---- week grid ----
+     auto-fill rather than a hard 7 columns: seven usable day cards do not fit across a
+     laptop, let alone a phone, once each one has to hold weight and rep boxes. The week
+     reflows from 7 across to 1 down and every day stays fully editable at any width. */
+  #week { display: grid; gap: .55rem; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); align-items: start; }
+  .day {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow); display: flex; flex-direction: column; overflow: hidden;
+  }
+  .day.today { border-color: var(--today-ring); box-shadow: 0 0 0 1px var(--today-ring), var(--shadow); }
+  .day.rest { background: var(--panel-2); }
+  .day-head {
+    display: flex; align-items: center; gap: .4rem; padding: .4rem .55rem;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .day.rest .day-head { background: var(--panel-2); }
+  .day-dow { font-weight: 700; font-size: .82rem; letter-spacing: .02em; }
+  .day-date { font-size: .72rem; color: var(--muted); }
+  .day-head .spacer { flex: 1; }
+  .badge {
+    font-size: .66rem; font-weight: 650; letter-spacing: .04em; text-transform: uppercase;
+    padding: .1rem .42rem; border-radius: 999px; border: 1px solid; cursor: pointer;
+    white-space: nowrap;
+  }
+  .badge.rest { color: var(--rest-fg); background: var(--rest-bg); border-color: var(--rest-fg); }
+  .badge.lift { color: var(--lift-fg); background: var(--lift-bg); border-color: var(--lift-fg); }
+  .day-body { padding: .4rem .55rem .5rem; }
+  /* Rest days are most of most weeks, so they are one compact line rather than a card
+     with a graphic in it. Seven tall empty cards is a lot of thumb-scrolling on a phone
+     to reach the one day that actually has a workout on it. */
+  .day-rest-body { display: flex; align-items: center; gap: .4rem; padding: .35rem .55rem .45rem; }
+  .day-rest-body .txt { color: var(--muted); font-size: .78rem; flex: 1; }
+  .day-empty-note { color: var(--muted); font-size: .78rem; padding: .1rem .1rem .35rem; }
+  .day-foot { display: flex; gap: .3rem; align-items: center; margin-top: .4rem; }
+  .day-foot select { flex: 1; min-width: 0; font-size: .78rem; }
+
+  /* ---- exercise row + its sets ---- */
+  .entry { border: 1px solid var(--border); border-radius: 8px; margin-bottom: .35rem; background: var(--panel); }
+  .entry-head {
+    display: flex; align-items: center; gap: .35rem; padding: .32rem .4rem; cursor: pointer;
+    user-select: none; border-radius: 7px;
+  }
+  .entry-head:hover { background: var(--accent-bg); }
+  /* Stacked rather than side-by-side, so reordering costs no width from the name and
+     summary columns that are already tight on a phone-width day card. */
+  .entry-move { display: flex; flex-direction: column; flex: none; }
+  .entry-move button {
+    padding: 0 .2rem; font-size: .55rem; line-height: 1.3; border: none;
+    background: transparent; color: var(--faint); border-radius: 3px;
+  }
+  .entry-move button:hover:not(:disabled) { color: var(--text); background: var(--panel-2); }
+  .entry-move button:disabled { opacity: .25; cursor: default; }
+  .entry-head .caret { color: var(--faint); width: .7rem; flex: none; font-size: .7rem; transition: transform .12s; }
+  .entry.open .entry-head .caret { transform: rotate(90deg); }
+  .entry-head .ex-name { font-weight: 600; font-size: .84rem; flex: 1; min-width: 0; word-break: break-word; }
+  .entry-head .ex-sum { font-size: .7rem; color: var(--muted); white-space: nowrap; flex: none; }
+  .entry-head .ex-sum.done { color: var(--ok); font-weight: 600; }
+  /* A container, so the set rows can respond to how much room this card actually got --
+     the week grid's column count doesn't track viewport width closely enough for a media
+     query to know. Six cards across a laptop and one card on a phone are both "narrow"
+     by different measures. */
+  .entry-sets { padding: .1rem .4rem .4rem; border-top: 1px dashed var(--border); container-type: inline-size; }
+  .entry:not(.open) .entry-sets { display: none; }
+  /* Below this the row would clip the word to "r". The × already says these are reps, and
+     the weight, the target and RIR are all worth more than the label is. Raised from the
+     original 278px once the +1 buttons joined the row -- they need the space the label
+     would have taken sooner than before. */
+  @container (max-width: 320px) { .set-row .rl { display: none; } }
+  /* Below this even "RIR" goes -- the RIR box and its own +1 button sit right next to
+     each other and read fine unlabeled once the row is this tight. */
+  @container (max-width: 250px) { .set-row .rirl { display: none; } }
+
+  /* Seven day cards across a laptop leaves a set row about 230px to work in, and it now
+     carries a weight, a rep count, its target, two +1 buttons and an RIR box. Everything
+     is sized in the smallest type the row can carry, and the flexible cells (.rl, then
+     .rirl) collapse first. */
+  .set-row { display: flex; align-items: center; gap: .22rem; padding: .16rem 0; }
+  .set-row .n {
+    width: 1.1rem; flex: none; text-align: center; font-size: .68rem; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Fixed widths and tabular numerals so the weight column stays a column: 45 and 225
+     must line up down the card or a glance can't read it. */
+  .set-row input.w { width: 3.6rem; flex: none; text-align: right; font-variant-numeric: tabular-nums; font-size: .82rem; padding: .18rem .28rem; }
+  .set-row input.r { width: 2.4rem; flex: none; text-align: center; font-variant-numeric: tabular-nums; font-size: .82rem; padding: .18rem .2rem; }
+  .set-row input.rir { width: 1.9rem; flex: none; text-align: center; font-variant-numeric: tabular-nums; font-size: .82rem; padding: .18rem .15rem; }
+  .set-row .unit, .set-row .x, .set-row .rl, .set-row .tgt, .set-row .rirl {
+    font-size: .68rem; color: var(--faint); flex: none;
+  }
+  /* The target sits against the rep box as a suffix -- "8/5" reads as one fact, where a
+     gap between them would read as two numbers that happen to be adjacent. */
+  .set-row .tgt { min-width: .9rem; margin-left: -.1rem; font-variant-numeric: tabular-nums; }
+  /* The elastic cell: it holds the word "reps" where the card is wide enough for it (see
+     the container query below) and is what pushes the delete button to the right edge. */
+  .set-row .rl { flex: 1 1 auto; min-width: 0; white-space: nowrap; }
+  .set-row .rl-gap { flex: 1 1 auto; min-width: 0; }
+  .set-row.logged input.r { border-color: var(--ok); background: var(--ok-bg); color: var(--ok); font-weight: 650; }
+  /* RIR is deliberately not part of "logged": a set is logged when you have said how many
+     reps you got. How close to failure it felt is worth recording and worth leaving
+     blank, so it gets its own quieter colour instead of gating the green. */
+  .set-row input.rir:not(:placeholder-shown) { border-color: var(--info); color: var(--info); font-weight: 650; }
+  .set-row .del { visibility: hidden; }
+  .set-row:hover .del, .set-row:focus-within .del { visibility: visible; }
+  /* Unlike .del, always visible rather than hover-gated: this is a phone-at-the-rack app
+     and a tap target that only appears on hover is one a touchscreen can never reach. */
+  .set-row .bump {
+    width: 1.05rem; height: 1.05rem; flex: none; padding: 0; font-size: .8rem; line-height: 1;
+    color: var(--accent); border-color: transparent; background: transparent;
+  }
+  .set-row .bump:hover { background: var(--accent-bg); border-color: var(--accent); }
+  .set-add { display: flex; gap: .3rem; margin-top: .2rem; padding-left: 1.32rem; }
+
+  /* A scheme badge on the collapsed exercise row, so a wave is recognisable without
+     opening it. Static is the default and says nothing -- a badge on every row would be
+     noise carrying one bit. */
+  .entry-head .scheme {
+    font-size: .6rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    padding: .05rem .3rem; border-radius: 4px; flex: none;
+    color: var(--info); background: var(--info-bg); border: 1px solid var(--info);
+  }
+
+  /* ---- library ---- */
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: .6rem; max-width: 900px; }
+  .panel h3 { margin: 0 0 .5rem; font-size: .85rem; }
+  .lib-row { display: flex; align-items: center; gap: .35rem; padding: .25rem 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .lib-row:last-of-type { border-bottom: none; }
+  .lib-row .nm { flex: 2 1 10rem; min-width: 7rem; }
+  .lib-row .gp { flex: 1 1 6rem; min-width: 5.5rem; }
+  .lib-row .num { width: 5rem; flex: none; text-align: right; font-variant-numeric: tabular-nums; }
+  /* Reps is a smaller number than Max Weight (1..12, never more than two digits) and gets
+     its own narrower column instead of sharing .num's width for a value that never needs it. */
+  .lib-row .rp { width: 2.6rem; flex: none; text-align: right; font-variant-numeric: tabular-nums; }
+  .lib-row .cap { font-size: .66rem; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* The caret column, so the name still starts at the same x whether or not a row is
+     expanded -- a library that shuffles sideways as you open rows is unreadable. */
+  .lib-row .cr { width: 1.4rem; flex: none; padding: .1rem 0; font-size: .7rem; line-height: 1.4;
+    color: var(--faint); background: transparent; border-color: transparent; }
+  .lib-row .cr:hover { color: var(--text); border-color: var(--border); }
+  .lib-row.open .cr { color: var(--accent); }
+  /* Pip is derived, never typed, so it is text and not an input -- the box would invite
+     an edit that has nowhere to go. Padding matches the inputs so the columns line up. */
+  .lib-row .pip { width: 4rem; flex: none; text-align: right; font-variant-numeric: tabular-nums;
+    font-size: .85rem; color: var(--muted); padding: .25rem .4rem; }
+  .lib-row .pip.cap { font-size: .66rem; color: var(--faint); }
+  /* Icon-only delete, sized to match the header's blank spacer column so the row's right
+     edge lines up whether or not a given movement's button is wide enough to wrap. */
+  .lib-row .del-col { width: 2rem; flex: none; }
+  .lib-row .ex-del { width: 2rem; flex: none; padding: .1rem 0; font-size: .85rem; line-height: 1.3; }
+
+  /* Muscle groups are colour-coded by hue: the row carries a --g-h and one rule turns the
+     select into a chip. Doing it with a custom property rather than a class per group is
+     what lets the dark theme restate three lightnesses instead of twelve colours. An
+     unset group sets --g-s to 0% and comes out grey from the same rule. */
+  .mg {
+    appearance: none; -webkit-appearance: none; font-size: .76rem; font-weight: 600;
+    padding-right: 1.15rem;
+    background-color: hsl(var(--g-h) var(--g-s) 92%);
+    color: hsl(var(--g-h) var(--g-s) 26%);
+    border-color: hsl(var(--g-h) var(--g-s) 76%);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right .35rem center; background-size: .5rem;
+    /* The trigger can be narrower than a label like "Delts (R)" once the column shrinks
+       for a phone -- clip it there rather than forcing the row wider. The open dropdown's
+       options are unaffected, since this only clips the closed control's own box. */
+    text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+  }
+  /* The dropdown itself is painted by the OS, not by us; give its options the page
+     colours so a light popup can't open over a dark page. */
+  .mg option { background: var(--panel); color: var(--text); font-weight: 400; }
+  @media (prefers-color-scheme: dark) {
+    .mg {
+      background-color: hsl(var(--g-h) var(--g-s) 18%);
+      color: hsl(var(--g-h) var(--g-s) 76%);
+      border-color: hsl(var(--g-h) var(--g-s) 32%);
+    }
+  }
+
+  /* The rep-max expander. Full-width child of the wrapping flex row, so it drops under
+     the row it belongs to without a second container around everything. */
+  .lib-reps {
+    flex: 1 1 100%; display: grid; gap: .25rem; margin: .15rem 0 .4rem 1.75rem;
+    grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+  }
+  .lib-reps .note { grid-column: 1 / -1; font-size: .7rem; color: var(--muted); margin: 0; }
+  /* Same indent as .lib-reps above it, so the two expanded blocks read as one disclosure
+     rather than the notes looking like they belong to a different row. */
+  .lib-notes-wrap { flex: 1 1 100%; margin: 0 0 .3rem 1.75rem; }
+  .lib-notes-wrap .field { font-size: .68rem; color: var(--faint); gap: .1rem; }
+  .lib-notes { width: 100%; resize: vertical; font-family: inherit; font-size: .8rem; }
+  .rm {
+    display: flex; align-items: baseline; gap: .35rem; padding: .18rem .45rem;
+    border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2);
+  }
+  .rm .n { font-size: .68rem; color: var(--faint); font-weight: 650; width: 3.1rem; flex: none; }
+  .rm .w { font-size: .84rem; font-variant-numeric: tabular-nums; }
+  .rm .u { font-size: .66rem; color: var(--faint); }
+  .lib-add { display: flex; gap: .3rem; margin-top: .6rem; flex-wrap: wrap; }
+  .hint { font-size: .72rem; color: var(--muted); margin: .5rem 0 0; }
+  .warn-note { font-size: .7rem; color: var(--warn); margin: .25rem 0 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; background: var(--panel-2); padding: .05rem .25rem; border-radius: 4px; }
+
+  /* ---- program ---- */
+  .prog-slots { display: grid; gap: .6rem; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    margin: .6rem 0; }
+  .prog-day-label { font-weight: 650; font-size: .78rem; margin-bottom: .3rem; }
+  .prog-slot { display: flex; align-items: center; gap: .35rem; padding: .18rem 0; }
+  .prog-slot-ex { flex: 1 1 auto; min-width: 0; font-size: .8rem; word-break: break-word; }
+  .prog-slot-ex .warn-note { display: block; }
+  .prog-slot-w { width: 4.4rem; flex: none; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* Overlays: the feedback form and the add-exercise dialog. Same shell, since they are
+     the same thing -- a panel over the page that takes focus until it's answered. */
+  #fb-modal, #add-modal, #program-modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
+    justify-content: center; padding: 1rem; background: rgba(0,0,0,.35); }
+  #fb-modal[hidden], #add-modal[hidden], #program-modal[hidden] { display: none; }
+  .fb-box { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--shadow); width: min(520px, 100%); max-height: 90vh; overflow-y: auto; padding: .8rem; }
+  .fb-box h3 { margin: 0 0 .2rem; font-size: .95rem; }
+
+  /* ---- add-exercise dialog ---- */
+  /* A segmented control rather than a select: there are two schemes, they are the whole
+     decision the dialog exists to take, and both should be readable without opening
+     anything. */
+  .seg { display: flex; gap: .3rem; margin: .1rem 0 .55rem; }
+  .seg button { flex: 1 1 0; text-align: left; padding: .4rem .55rem; line-height: 1.25; }
+  .seg button.active { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+  .seg .t { display: block; font-weight: 650; font-size: .85rem; }
+  .seg .d { display: block; font-size: .68rem; color: var(--muted); }
+  .seg button.active .d { color: var(--accent); opacity: .85; }
+  .add-fields { display: flex; gap: .5rem; margin-bottom: .55rem; }
+  /* min-width:0 is load-bearing: a flex item's automatic minimum is its content's
+     min-content width, and an <input>'s is the browser's default ~20 characters -- so
+     without it these two single-digit boxes refuse to shrink and span the dialog. */
+  .add-fields label.field { flex: 0 0 auto; min-width: 0; }
+  .add-fields label.field > input {
+    width: 3.4rem; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  /* The dialog shows the sets it is about to create, built by the same planSets() that
+     will create them -- so what you approve and what you get cannot disagree. */
+  .add-preview { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
+    padding: .35rem .5rem; }
+  .add-preview .hd { font-size: .66rem; color: var(--faint); text-transform: uppercase;
+    letter-spacing: .04em; font-weight: 650; margin-bottom: .15rem; }
+  .add-preview ol { margin: 0; padding: 0; list-style: none; }
+  .add-preview li { display: flex; gap: .4rem; font-size: .82rem; padding: .08rem 0;
+    font-variant-numeric: tabular-nums; }
+  .add-preview li .i { width: 1.2rem; color: var(--faint); font-size: .7rem; }
+  .add-preview li .wt { width: 4.6rem; text-align: right; }
+  .add-preview li .rp { color: var(--muted); }
+  .add-preview .warn-note { font-size: .7rem; color: var(--warn); margin: .25rem 0 0; }
+  .fb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; margin: .5rem 0; }
+  .fb-box textarea { width: 100%; resize: vertical; font-family: inherit; }
+  .fb-actions { display: flex; gap: .4rem; align-items: center; margin-top: .6rem; }
+  .fb-ctx { font-size: .68rem; color: var(--faint); font-family: ui-monospace, Menlo, monospace;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: .35rem .45rem; margin-top: .5rem; max-height: 7rem; overflow: auto; white-space: pre-wrap; }
+
+  @media (max-width: 700px) {
+    /* Phone layout: title on its own line, tabs on theirs, then the pill/feedback row.
+       Everything is allowed to shrink to zero so nothing can push the page sideways. */
+    header { gap: .35rem .4rem; }
+    header h1 { width: 100%; margin: 0; }
+    .tabs { flex: 1 1 100%; }
+    .tabs button { flex: 1 1 auto; }
+    #week { grid-template-columns: 1fr; }
+    main { padding: .5rem; }
+    /* The bar is a horizontal scroller on a wide screen, where everything fits on one
+       line. On a phone it doesn't, and a nowrap flex row with an auto margin lays the
+       summary straight over the date range — so here it wraps to two lines instead. */
+    #weekbar { flex-wrap: wrap; overflow-x: visible; white-space: normal; }
+    #weekbar .rangelabel { min-width: 0; flex: 1 1 auto; }
+    #week-summary { flex: 1 1 100%; margin-left: 0; padding-left: 0; }
+
+    /* Library rows at the desktop widths above run name + group + reps + weight + pip +
+       delete past 700px wide before wrapping — on an iPhone 13's 390px viewport that's a
+       second row per movement. Narrowed here so one exercise stays one line: smaller type,
+       tighter columns, an icon instead of the word "Delete". */
+    .panel { padding: .5rem; }
+    .lib-row { gap: .2rem; }
+    .lib-row .nm { flex: 1 1 4.2rem; min-width: 4rem; font-size: .78rem; padding: .2rem .3rem; }
+    .lib-row .gp { flex: 0 1 4rem; min-width: 3.4rem; font-size: .68rem; padding: .2rem 1rem .2rem .3rem; }
+    .lib-row .rp { width: 2rem; font-size: .78rem; padding: .2rem .2rem; }
+    .lib-row .num { width: 3.3rem; font-size: .78rem; padding: .2rem .3rem; }
+    .lib-row .pip { width: 2.1rem; font-size: .7rem; padding: .2rem .15rem; }
+    .lib-row .del-col, .lib-row .ex-del { width: 1.5rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏋 Lift Tracker</h1>
+  <div class="tabs" id="tabs"></div>
+  <span class="spacer"></span>
+  <span class="pill" id="sync-pill">…</span>
+  <button id="btn-feedback" title="Report something (f)">Feedback</button>
+</header>
+
+<div id="weekbar">
+  <button class="small" id="wk-prev" title="Previous week ([)">←</button>
+  <button class="small" id="wk-today">This week</button>
+  <button class="small" id="wk-next" title="Next week (])">→</button>
+  <span class="rangelabel" id="wk-label"></span>
+  <span id="week-summary"></span>
+</div>
+
+<main><div id="view"></div></main>
+
+<div id="fb-modal" hidden></div>
+<div id="add-modal" hidden></div>
+<div id="program-modal" hidden></div>
+
+<script>
+"use strict";
+
+const VIEWS = [
+  { id: "week", label: "Week" },
+  { id: "library", label: "Library" },
+  { id: "program", label: "Program" },
+];
+const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+// The muscle-group vocabulary, in the order it appears in the picker: legs up through
+// the torso and out to the arms. Each one carries a hue so a group reads as a colour
+// before it reads as a word -- the three delt heads sit on adjacent hues on purpose,
+// because they are one muscle scored three ways and should look like a family.
+const MUSCLE_GROUPS = [
+  { id: "quads",       label: "Quads",     hue: 145 },
+  { id: "hams",        label: "Hams",      hue: 178 },
+  { id: "glutes",      label: "Glutes",    hue: 200 },
+  { id: "chest",       label: "Chest",     hue: 348 },
+  { id: "delts-rear",  label: "Delts (R)", hue: 18 },
+  { id: "delts-front", label: "Delts (F)", hue: 36 },
+  { id: "delts-side",  label: "Delts (S)", hue: 54 },
+  { id: "back",        label: "Back",      hue: 228 },
+  { id: "abs",         label: "Abs",       hue: 95 },
+  { id: "neck",        label: "Neck",      hue: 315 },
+  { id: "biceps",      label: "Biceps",    hue: 262 },
+  { id: "triceps",     label: "Triceps",   hue: 288 },
+];
+// Groups from before this vocabulary, mapped for display only -- nothing rewrites the
+// stored value behind your back. Only the unambiguous ones are translated: this list
+// splits "legs" three ways and "arms" two, and a squat filed as Hams or a pushdown filed
+// as Biceps is worse than a blank asking to be filled in. So those come out unset.
+const LEGACY_GROUPS = {
+  core: "abs",
+  legs: "", shoulders: "", arms: "", cardio: "", other: "",
+};
+const GROUP_BY_ID = new Map(MUSCLE_GROUPS.map((g) => [g.id, g]));
+
+// A pip is 2.5% of a lift's one-rep max -- the natural unit of progress, since 5 lb is a
+// rounding error on a 405 deadlift and a third of a set of curls.
+const PIP_FRACTION = 0.025;
+// Rep maxes fall off one pip per rep, so a 200 lb single is 200 - 3 x 5 = 185 for a
+// triple. Only the one-rep max is stored and editable; rows 2..12 are pure arithmetic on
+// it, which is why the expander shows them as text and not as inputs.
+const REP_MAX_MAX = 12;
+
+// ---- Rep schemes ----------------------------------------------------------
+// How the sets of a new exercise are laid out. "Static" is the plain case: n sets of the
+// same reps at the same weight. "Peak" waves up to a heavy double and back down again,
+// and prices each rung off the library's one-rep max in pips.
+//
+// Those offsets are deliberately *not* the library's own rep-max table, where a five is
+// five pips down. A rep max is the most you could do for those reps; a working set inside
+// a wave is not meant to be, and the extra discount is what leaves the last set of five
+// still there after the double.
+const PEAK_REPS = [5, 4, 2, 4, 5];
+const PEAK_PIPS_OFF = { 5: 10, 4: 8, 2: 5 };
+const DEFAULT_STATIC_REPS = 8;
+// Sets in the add dialog are a single digit, per the report. The library's own default
+// still goes up to 12; anything above 9 is clamped on the way into the dialog.
+const MAX_SCHEME_SETS = 9;
+// Reps in reserve: how many more you had in you. A single digit, and 0 is a real answer
+// -- it means you had nothing left, which is the whole point of recording it.
+const MAX_RIR = 9;
+// Reps are capped at two digits because the field is two digits: it's a rep count, not a
+// duration, and 99 is comfortably past anything anyone logs as a working set.
+const MAX_REPS = 99;
+
+// ===========================================================================
+// Programs
+//
+// A program is a pre-built plan, not something a user authors -- the same relationship
+// the library has to a rep scheme. Each one names a fixed set of day-slots (a movement, a
+// rep scheme, a day of the week) and, for Peak slots, a per-week/per-set pip schedule
+// priced off a one-rep max fixed when the program starts. Activating a program writes one
+// row to the `programs` collection holding that instance's state -- everything about what
+// the program *is* lives here in code, the same way PEAK_REPS and MUSCLE_GROUPS do.
+//
+// At most one program is active at a time (enforced in activateProgram()). Weeks are
+// generated one at a time, never all up front: a static slot's progression reads the
+// *previous week's logged results*, which don't exist yet for a week nobody's lifted.
+// ===========================================================================
+
+// Every Peak slot in every program shares this: the offset (in pips) added on top of a
+// 75%-of-1RM floor, per set, per program-week. Row 0 = week 1; columns line up with
+// PEAK_REPS (5,4,2,4,5), so column 2 is always the wave's heavy double. Week 5 is a flat
+// deload (every set at 75%); week 6 tests, holding four sets light and sending the double
+// to within one pip of the max.
+const PROGRAM_PEAK_PIPS = [
+  [0, 1, 2, 1, 0],   // week 1
+  [1, 2, 4, 2, 1],   // week 2
+  [2, 3, 6, 3, 2],   // week 3
+  [2, 4, 7, 4, 2],   // week 4
+  [0, 0, 0, 0, 0],   // week 5 -- deload
+  [0, 1, 9, 1, 0],   // week 6 -- test
+];
+// 75% of a one-rep max is 10 pips below it, since a pip is 2.5%. Every week's offsets
+// above are added back on top of that floor.
+const PROGRAM_PEAK_BASE_PIPS = 10;
+const PROGRAM_WEEKLY_STATIC_INCREMENT_FALLBACK = 5; // used only if an exercise has none
+
+function programPeakWeight(oneRepMax, week, setIndex) {
+  const offset = PROGRAM_PEAK_PIPS[week - 1][setIndex] || 0;
+  return floorWeight(num(oneRepMax, 0) - (PROGRAM_PEAK_BASE_PIPS - offset) * pipFor(oneRepMax));
+}
+
+// Resolves a program slot's movement name to a real Library row. Prefers the
+// highest-`order` (most recently added) match when a name is ambiguous -- this store has
+// two "Lat Pulldown" rows from a re-add, and the newer one is the one actually in use.
+function programResolveExercise(name) {
+  const matches = (state.doc?.exercises || []).filter((e) => e.name === name);
+  if (!matches.length) return null;
+  return matches.reduce((a, b) => (num(b.order, 0) > num(a.order, 0) ? b : a));
+}
+
+const PROGRAMS = {
+  "phase1-volume": {
+    id: "phase1-volume",
+    name: "Phase 1: Volume",
+    weeks: 6,
+    blurb: "Six weeks pushing 2-rep-max weights on the big lifts while accumulating " +
+      "volume there and in accessories. Weeks 1–4 progress, week 5 deloads, week 6 tests.",
+    // One entry per weekday that isn't a rest day. dow: 0=Mon .. 6=Sun, matching DOW.
+    // Each slot: id (stable key for weight overrides + progression bookkeeping),
+    // exercise (a Library movement name, resolved via programResolveExercise()), scheme,
+    // and for static slots the set count + starting rep target -- all sourced from the
+    // week of Aug 24, the program's own reference week.
+    days: [
+      { dow: 0, slots: [
+        { id: "mon-bench", exercise: "Barbell Bench Press", scheme: "peak" },
+        { id: "mon-squat", exercise: "Barbell Back Squat", scheme: "peak" },
+        { id: "mon-deadlift", exercise: "Deadlift", scheme: "peak" },
+        { id: "mon-crunch", exercise: "Cable Crunch", scheme: "static", sets: 3, reps: 20 },
+      ] },
+      { dow: 1, slots: [
+        { id: "tue-row", exercise: "Pendlay Row", scheme: "static", sets: 2, reps: 8 },
+        { id: "tue-tricep", exercise: "OH Triceps Xt", scheme: "static", sets: 2, reps: 10 },
+        { id: "tue-legcurl", exercise: "Seated Leg Curl", scheme: "static", sets: 2, reps: 12 },
+        { id: "tue-neutralrow", exercise: "Seated Neutral Row", scheme: "static", sets: 2, reps: 12 },
+        { id: "tue-pausebench", exercise: "Pause Bench Press", scheme: "static", sets: 2, reps: 8 },
+        { id: "tue-altcurl", exercise: "Seated Alt Curl", scheme: "static", sets: 3, reps: 15 },
+        { id: "tue-facepull", exercise: "Face Pull", scheme: "static", sets: 2, reps: 15 },
+      ] },
+      { dow: 2, slots: [
+        { id: "wed-rdl", exercise: "RDL", scheme: "static", sets: 5, reps: 5 },
+        { id: "wed-inclinebench", exercise: "Incline Bench Press", scheme: "peak" },
+        { id: "wed-frontsquat", exercise: "Front Squat", scheme: "peak" },
+        { id: "wed-abwheel", exercise: "Ab Wheel", scheme: "static", sets: 3, reps: 10 },
+      ] },
+      { dow: 3, slots: [
+        { id: "thu-latpulldown", exercise: "Lat Pulldown", scheme: "static", sets: 2, reps: 10 },
+        { id: "thu-hipthrust", exercise: "BB Hip Thrust", scheme: "static", sets: 2, reps: 10 },
+        { id: "thu-shoulderpress", exercise: "DB Shoulder Press", scheme: "static", sets: 2, reps: 12 },
+        { id: "thu-preachercurl", exercise: "Preacher Curls", scheme: "static", sets: 2, reps: 12 },
+        { id: "thu-dips", exercise: "Dips", scheme: "static", sets: 2, reps: 10 },
+        { id: "thu-ezcurl", exercise: "EZ Bar Curl", scheme: "static", sets: 2, reps: 15 },
+        { id: "thu-lateralraise", exercise: "Lateral Raise", scheme: "static", sets: 3, reps: 15 },
+      ] },
+      { dow: 4, slots: [
+        { id: "fri-deadlift", exercise: "Deadlift", scheme: "peak" },
+        { id: "fri-bench", exercise: "Barbell Bench Press", scheme: "peak" },
+        { id: "fri-squat", exercise: "Barbell Back Squat", scheme: "peak" },
+        { id: "fri-situp", exercise: "Sit Up", scheme: "static", sets: 3, reps: 10 },
+      ] },
+    ],
+  },
+};
+
+// ===========================================================================
+// State
+// ===========================================================================
+const state = {
+  doc: null,
+  rev: -1,
+  view: "week",
+  weekStart: null,             // Monday of the displayed week, "YYYY-MM-DD"
+  // Which exercise rows are expanded. Deliberately client-side only: which rows you have
+  // open is about the device in your hand, not about the training log, and syncing it
+  // would mean the laptop folding up a row on the phone mid-set.
+  expanded: new Set(),
+  // Which library rows have their rep-max table open. Client-side for the same reason as
+  // `expanded` above: it is about the screen you are looking at, not the training log.
+  libExpanded: new Set(),
+  // Set while one of our own mutations is in flight. The poller skips refreshing during
+  // that window: our optimistic copy is ahead of the server, and pulling the older
+  // document back would visibly undo the edit for a beat before the response lands.
+  pending: 0,
+  online: false,
+  saveTimers: {},
+};
+
+// ===========================================================================
+// Small helpers
+// ===========================================================================
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function uid(prefix) {
+  return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+// Dates are handled as plain "YYYY-MM-DD" strings throughout, never as Date objects in
+// storage — a workout happens on a calendar day, not at an instant, and going through
+// Date() in the browser's local zone is how off-by-one-day bugs get in. These helpers
+// convert only for arithmetic, always at UTC noon so a DST shift can't move a date
+// across midnight.
+function dateToNum(iso) { return Date.parse(iso + "T12:00:00Z"); }
+function numToDate(ms) { return new Date(ms).toISOString().slice(0, 10); }
+function addDays(iso, n) { return numToDate(dateToNum(iso) + n * 86400000); }
+function todayISO() {
+  const d = new Date();
+  return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, "0"),
+          String(d.getDate()).padStart(2, "0")].join("-");
+}
+function fmtDate(iso) {
+  const [, m, d] = iso.split("-");
+  return MONTHS[+m - 1] + " " + (+d);
+}
+// Monday-start weeks: training programmes are written that way, and it keeps the weekend
+// together at the end of the card grid instead of split across both ends.
+function weekStartOf(iso) {
+  const jsDow = new Date(dateToNum(iso)).getUTCDay();   // 0 = Sunday
+  return addDays(iso, -((jsDow + 6) % 7));
+}
+function weekDates(start) { return Array.from({ length: 7 }, (_, i) => addDays(start, i)); }
+
+const num = (v, fallback = 0) => (Number.isFinite(+v) && String(v).trim() !== "" ? +v : fallback);
+// Trailing zeros make a column of weights harder to scan: 137.5 and 45, not 137.50 and 45.00.
+const fmtWeight = (w) => (Math.round(num(w) * 100) / 100).toString();
+
+// Pips are shown to one decimal, always -- "5.0" and "0.6" in a column read as the same
+// kind of number, where "5" and "0.63" do not.
+const pipFor = (oneRepMax) => num(oneRepMax, 0) * PIP_FRACTION;
+const fmtPip = (oneRepMax) => pipFor(oneRepMax).toFixed(1);
+
+// Weights the app computes from the pip model come out fractional -- 2.5% of a 185 lb max
+// is 4.625 -- and nobody's rack has a 4.625 lb plate. Floored, never rounded, so the
+// number is always a weight you could actually load: 69.9 reads as 65, not as an
+// optimistic 70. Only applies to weights the app derives; what you type yourself is yours.
+const floorWeight = (w) => Math.floor(num(w, 0) / 5) * 5;
+const repMaxWeight = (oneRepMax, reps) => floorWeight(num(oneRepMax, 0) - reps * pipFor(oneRepMax));
+
+// The Library's Max Weight isn't necessarily a one-rep max any more -- it's "the most you
+// can lift for Reps reps," and Reps defaults to 1 (a genuine single, so the number typed
+// in is the max, unchanged from before this existed). From 2 reps up it's read as sitting
+// where repMaxWeight() would put it -- reps*2.5% below the single -- so this inverts that
+// formula to recover the single everything else on the row (the pip, the rest of the rep
+// max table, a Peak scheme's rungs) is still priced off.
+function estimatedOneRepMax(ex) {
+  const weight = num(ex?.defaultWeight, 0);
+  const reps = Math.max(1, Math.min(REP_MAX_MAX, num(ex?.maxReps, 1)));
+  return reps <= 1 ? weight : weight / (1 - reps * PIP_FRACTION);
+}
+
+// An entry with no scheme recorded predates them and is a static one; that is what the
+// old behaviour was, so nothing on a day already logged changes meaning.
+const schemeOf = (entry) => (entry?.scheme === "peak" ? "peak" : "static");
+const SCHEME_LABEL = { static: "Static", peak: "Peak" };
+const peakWeight = (oneRepMax, reps) =>
+  floorWeight(num(oneRepMax, 0) - (PEAK_PIPS_OFF[reps] || 0) * pipFor(oneRepMax));
+
+// Resolve an exercise's stored group to a row of MUSCLE_GROUPS, translating a legacy
+// value on the way through. Returns null for "no group", which is a real state: a new
+// movement starts without one rather than being filed under a guess.
+function groupOf(ex) {
+  const raw = String(ex?.muscleGroup || "");
+  const id = GROUP_BY_ID.has(raw) ? raw : (LEGACY_GROUPS[raw] ?? "");
+  return GROUP_BY_ID.get(id) || null;
+}
+const groupStyle = (g) => (g ? `--g-h:${g.hue};--g-s:62%` : "--g-h:0;--g-s:0%");
+
+function exerciseById(id) { return (state.doc?.exercises || []).find((e) => e.id === id) || null; }
+function sortedExercises() {
+  return [...(state.doc?.exercises || [])]
+    .sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
+}
+function dayFor(date) { return (state.doc?.days || []).find((d) => d.date === date) || null; }
+function entriesFor(dayId) {
+  return (state.doc?.entries || []).filter((e) => e.dayId === dayId)
+    .sort((a, b) => (a.order || 0) - (b.order || 0));
+}
+function setsFor(entryId) {
+  return (state.doc?.sets || []).filter((s) => s.entryId === entryId)
+    .sort((a, b) => (a.index || 0) - (b.index || 0));
+}
+// A day with no record at all is a rest day. That's the default on purpose: most days in
+// most weeks are rest days, and making them cost a write would fill the log with rows
+// that say nothing happened.
+function dayType(date) { return dayFor(date)?.type === "lift" ? "lift" : "rest"; }
+
+// ===========================================================================
+// Server transport
+// ===========================================================================
+function setPill(kind, text) {
+  const el = $("#sync-pill");
+  el.className = "pill " + kind;
+  el.textContent = text;
+}
+
+async function apiGet(path) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return await res.json();
+}
+
+async function loadState() {
+  const body = await apiGet("/api/state");
+  state.doc = body.state;
+  state.rev = body.state._meta.rev;
+}
+
+// mutate() calls this right as it's applied an edit that (very often) originated from an
+// onchange fired mid-blur -- tabbing off a field, or a bump button stealing focus from
+// one. Chrome has a known quirk there ("...the node to be removed is no longer a child of
+// this node. Perhaps it was moved in a 'blur' event handler?") where a synchronous
+// innerHTML replacement of an ancestor of the still-blurring element can throw. It's
+// self-healing -- the next render (the debounced save landing, the next poll) repaints
+// correctly -- so it's swallowed here rather than left to blow up mutate()'s promise into
+// an unhandled rejection.
+function safeRender() {
+  try { render(); } catch (e) { console.warn("render() failed, will retry on next update:", e); }
+}
+
+/**
+ * Send a batch of operations to the server, applying them locally first so the UI never
+ * waits on the network — which matters most in the one place this app is actually used,
+ * a phone on gym WiFi between sets. The server is the source of truth: its response
+ * replaces our document wholesale, which is also how we pick up anything another device
+ * changed meanwhile. On failure we re-read the server, so a rejected edit can't leave a
+ * phantom set on screen.
+ */
+async function mutate(ops) {
+  if (!state.doc) return;
+  applyOpsLocal(state.doc, ops);
+  safeRender();
+  state.pending++;
+  setPill("warn", "Saving…");
+  try {
+    const res = await fetch("/api/mutate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ops }),
+    });
+    const body = await res.json().catch(() => ({ ok: false, error: "HTTP " + res.status }));
+    if (!res.ok || !body.ok) throw new Error(body.error || ("HTTP " + res.status));
+    state.doc = body.state;
+    state.rev = body.rev;
+    setPill("ok", "Saved " + new Date().toLocaleTimeString());
+  } catch (e) {
+    setPill("bad", "Save failed — " + e.message);
+    try { await loadState(); } catch { /* offline; leave what we have on screen */ }
+  } finally {
+    state.pending--;
+    safeRender();
+  }
+}
+
+/**
+ * The client-side twin of apply_ops() in serve_lift_tracker.py. Kept deliberately literal
+ * against that function — same three ops, same merge semantics, same cascade on delete —
+ * so the optimistic render matches what the server will store.
+ */
+function applyOpsLocal(doc, ops) {
+  const stamp = new Date().toISOString();
+  for (const op of ops) {
+    const rows = doc[op.coll];
+    if (!rows) continue;
+    if (op.op === "upsert") {
+      const i = rows.findIndex((r) => r.id === op.value.id);
+      const value = { ...op.value, updatedAt: stamp };
+      if (i >= 0) rows[i] = value; else rows.push(value);
+    } else if (op.op === "patch") {
+      const row = rows.find((r) => r.id === op.id);
+      if (row) Object.assign(row, op.fields, { updatedAt: stamp });
+    } else if (op.op === "delete") {
+      const i = rows.findIndex((r) => r.id === op.id);
+      if (i >= 0) rows.splice(i, 1);
+      if (op.coll === "entries") {
+        doc.sets = doc.sets.filter((s) => s.entryId !== op.id);
+      } else if (op.coll === "days") {
+        const gone = new Set(doc.entries.filter((e) => e.dayId === op.id).map((e) => e.id));
+        doc.entries = doc.entries.filter((e) => e.dayId !== op.id);
+        doc.sets = doc.sets.filter((s) => !gone.has(s.entryId));
+      }
+    }
+  }
+}
+
+const patch = (coll, id, fields) => mutate([{ op: "patch", coll, id, fields }]);
+const upsert = (coll, value) => mutate([{ op: "upsert", coll, value }]);
+const remove = (coll, id) => mutate([{ op: "delete", coll, id }]);
+
+// Debounce a save so typing a weight doesn't fire a request per keystroke. Keyed, so two
+// fields being edited in turn each keep their own timer instead of cancelling each other.
+function saveLater(key, fn, ms = 600) {
+  clearTimeout(state.saveTimers[key]);
+  state.saveTimers[key] = setTimeout(() => { delete state.saveTimers[key]; fn(); }, ms);
+}
+function flushSaves() {
+  for (const key of Object.keys(state.saveTimers)) {
+    clearTimeout(state.saveTimers[key]);
+    delete state.saveTimers[key];
+  }
+}
+
+// Poll for other devices' edits. /api/rev is a few bytes, so this is cheap enough to run
+// on every open phone; the full document is only refetched when the number actually moved.
+async function poll() {
+  if (state.pending > 0) return;
+  // Two more reasons to hold off, both specific to logging a set: a debounced save is
+  // armed (the typed value isn't on the server yet, so pulling would paint over it), or
+  // a field has focus (someone is mid-entry, and a redraw under their thumb is worse
+  // than a few seconds of staleness).
+  if (Object.keys(state.saveTimers).length) return;
+  const ae = document.activeElement;
+  if (ae && ae.matches && ae.matches("input, select, textarea")) return;
+  // Cheap on every tick unless a program week actually just finished (at most six times
+  // over six weeks), and shares this function's existing not-mid-edit guards above.
+  maybeAdvanceProgram();
+  try {
+    const { rev } = await apiGet("/api/rev");
+    if (rev !== state.rev) {
+      await loadState();
+      render();
+      if ($("#sync-pill").className.indexOf("bad") >= 0) setPill("ok", "Up to date");
+    }
+    if (!state.online) { state.online = true; setPill("ok", "Connected"); }
+  } catch {
+    state.online = false;
+    setPill("bad", "Server unreachable");
+  }
+}
+
+// ===========================================================================
+// Weight suggestion
+//
+// The expected weight in a set row is the whole reason to keep history: you should not
+// have to remember what you squatted on Monday. The rule is deliberately dumb and
+// predictable — repeat what you last did for that exercise, set for set — because a
+// clever auto-progression that guesses wrong is worse than a number you can see is stale
+// and overwrite. Every suggestion is written into the set as a real value, so once it's
+// on screen it is yours to change and it never moves on its own afterwards.
+// ===========================================================================
+// Every session of a movement before a given date, most recent first. Both suggestions
+// below walk it, and both skip a session that has nothing to say rather than stopping at
+// it -- an entry added and never filled in shouldn't shadow the week before it.
+function priorSessions(exerciseId, beforeDate) {
+  const dayById = new Map((state.doc?.days || []).map((d) => [d.id, d]));
+  return (state.doc?.entries || [])
+    .filter((e) => e.exerciseId === exerciseId)
+    .map((e) => ({ entry: e, date: dayById.get(e.dayId)?.date }))
+    .filter((h) => h.date && h.date < beforeDate)
+    .sort((a, b) => (a.date < b.date ? 1 : -1));
+}
+
+function suggestWeight(exerciseId, beforeDate, setIndex) {
+  for (const h of priorSessions(exerciseId, beforeDate)) {
+    const prior = setsFor(h.entry.id).filter((s) => num(s.weight, null) !== null);
+    if (!prior.length) continue;
+    // Same slot if that session had one, otherwise its last set — an added fourth set
+    // should start from the third, not from the library default.
+    const match = prior[Math.min(setIndex, prior.length - 1)];
+    return num(match.weight, 0);
+  }
+  return num(exerciseById(exerciseId)?.defaultWeight, 0);
+}
+
+// What the Static scheme offers as a rep target: whatever you aimed for on this movement
+// last time. Same rule as the weight, for the same reason -- the useful default is what
+// you actually did, and the number is right there to change if this week is different.
+function suggestTargetReps(exerciseId, beforeDate) {
+  for (const h of priorSessions(exerciseId, beforeDate)) {
+    const target = setsFor(h.entry.id)
+      .map((st) => String(st.targetReps ?? "").trim()).filter(Boolean)[0];
+    if (target) return Math.min(MAX_REPS, +target);
+  }
+  return DEFAULT_STATIC_REPS;
+}
+
+// ===========================================================================
+// Mutations the UI actually performs
+// ===========================================================================
+// Day ids are derived from the date rather than random, so two devices that both flip
+// the same rest day to a lift day converge on one record instead of creating two days
+// that each hold half the workout.
+const dayIdFor = (date) => "day_" + date;
+
+function setDayType(date, type) {
+  const existing = dayFor(date);
+  if (type === "rest" && existing) {
+    // Dropping the day record cascades its entries and sets away, on the server and in
+    // applyOpsLocal alike. That's the intent of "this is a rest day now" — but it can
+    // throw away logged work, so it asks first.
+    const entries = entriesFor(existing.id);
+    if (entries.length && !confirm(
+      `Make ${fmtDate(date)} a rest day? That removes ${entries.length} exercise` +
+      `${entries.length === 1 ? "" : "s"} and their sets.`)) return;
+    return remove("days", existing.id);
+  }
+  if (type === "lift" && !existing) {
+    return upsert("days", { id: dayIdFor(date), date, type: "lift", note: "" });
+  }
+  if (existing && existing.type !== type) return patch("days", existing.id, { type });
+}
+
+/**
+ * Turn a chosen scheme into the actual list of sets, as {weight, targetReps} pairs. This
+ * is the whole of what a scheme *is* -- everything else about an entry is the same either
+ * way -- so the add dialog can render exactly what it is about to create by calling this
+ * and listing the result.
+ */
+function planSets(ex, date, plan) {
+  if (plan.scheme === "peak") {
+    // Every rung priced off the library's one-rep max, so the wave rescales the day the
+    // max does. Nothing here consults history: the point of a peak is that it is pinned
+    // to the current max, not to what last week happened to feel like.
+    const max = estimatedOneRepMax(ex);
+    return PEAK_REPS.map((reps) => ({ weight: peakWeight(max, reps), targetReps: String(reps) }));
+  }
+  const count = Math.max(1, Math.min(MAX_SCHEME_SETS, num(plan.sets, 3)));
+  const reps = Math.max(1, Math.min(MAX_REPS, num(plan.reps, DEFAULT_STATIC_REPS)));
+  // One weight across the whole thing, which is what makes it static. Defaults to history
+  // where there is any -- the first set of the last session you did this -- and falls back
+  // to the library max for a movement you have never logged; either way it's editable in
+  // the dialog, so plan.weight (once the dialog has touched it) wins when present.
+  const weight = plan.weight !== undefined && plan.weight !== ""
+    ? num(plan.weight, 0) : suggestWeight(ex.id, date, 0);
+  return Array.from({ length: count }, () => ({ weight, targetReps: String(reps) }));
+}
+
+// The order value for an exercise about to be added to a day -- one past the highest
+// order already on that day, not the entry count. Count-based numbering collides as soon
+// as an exercise has been removed from the middle of the day (the count drops but the
+// remaining orders don't renumber), which is how a newly added exercise could land
+// anywhere instead of always at the bottom.
+function nextEntryOrder(dayId) {
+  const list = entriesFor(dayId);
+  return list.length ? Math.max(...list.map((e) => e.order || 0)) + 1 : 0;
+}
+
+/** Move one exercise up or down within its day. Renumbers the whole day's entries 0..n-1
+ * on every move, which is also what keeps `order` gap-free and collision-free going
+ * forward regardless of how it got into whatever state it was in before. */
+function moveEntry(entryId, dir) {
+  const entry = (state.doc.entries || []).find((e) => e.id === entryId);
+  if (!entry) return;
+  const list = entriesFor(entry.dayId);
+  const i = list.findIndex((e) => e.id === entryId);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= list.length) return;
+  [list[i], list[j]] = [list[j], list[i]];
+  return mutate(list.map((e, idx) =>
+    ({ op: "patch", coll: "entries", id: e.id, fields: { order: idx } })));
+}
+
+function addExercise(date, exerciseId, plan) {
+  const ex = exerciseById(exerciseId);
+  if (!ex) return;
+  const rows = planSets(ex, date, plan);
+  const ops = [];
+  let day = dayFor(date);
+  if (!day) {
+    // Adding an exercise to a rest day is itself the statement that it's a lift day.
+    day = { id: dayIdFor(date), date, type: "lift", note: "" };
+    ops.push({ op: "upsert", coll: "days", value: day });
+  } else if (day.type !== "lift") {
+    ops.push({ op: "patch", coll: "days", id: day.id, fields: { type: "lift" } });
+  }
+  const entryId = uid("en");
+  ops.push({ op: "upsert", coll: "entries", value: {
+    id: entryId, dayId: day.id, exerciseId: ex.id,
+    // The name is copied, not just referenced. Renaming "Barbell Row" in the library
+    // later shouldn't silently retitle six months of finished sessions.
+    name: ex.name,
+    // Recorded so the row can say what it was built as. It is a label on what happened,
+    // not a live rule: editing a weight afterwards doesn't stop it having been a peak.
+    scheme: plan.scheme === "peak" ? "peak" : "static",
+    order: nextEntryOrder(day.id),
+  }});
+  rows.forEach((row, i) => {
+    ops.push({ op: "upsert", coll: "sets", value: {
+      id: uid("st"), entryId, index: i,
+      weight: row.weight,
+      unit: ex.unit || "lb",
+      targetReps: row.targetReps,
+      reps: "",
+      rir: "",
+    }});
+  });
+  state.expanded.add(entryId);   // an exercise you just added is one you're about to log
+  return mutate(ops);
+}
+
+function addSet(entryId) {
+  const entry = (state.doc.entries || []).find((e) => e.id === entryId);
+  if (!entry) return;
+  const existing = setsFor(entryId);
+  const last = existing[existing.length - 1];
+  const date = (state.doc.days || []).find((d) => d.id === entry.dayId)?.date || todayISO();
+  return upsert("sets", {
+    id: uid("st"), entryId, index: existing.length,
+    // Carry the previous set's weight forward rather than re-deriving from history: if
+    // you dropped from 135 to 115 this session, set four wants 115. Same for the target:
+    // a set bolted onto the end of a wave is a repeat of its last rung, not a new one.
+    weight: last ? num(last.weight, 0) : suggestWeight(entry.exerciseId, date, existing.length),
+    unit: last?.unit || exerciseById(entry.exerciseId)?.unit || "lb",
+    targetReps: last?.targetReps ?? "",
+    reps: "",
+    rir: "",
+  });
+}
+
+function newExercise(name) {
+  const clean = (name || "").trim();
+  if (!clean) return null;
+  const id = uid("ex");
+  upsert("exercises", {
+    id, name: clean, muscleGroup: "", defaultSets: 3, defaultWeight: 0, maxReps: 1,
+    increment: 5, unit: "lb", order: (state.doc.exercises || []).length, notes: "",
+  });
+  return id;
+}
+
+// ===========================================================================
+// Programs: engine
+// ===========================================================================
+function activeProgram() {
+  return (state.doc?.programs || []).find((p) => p.status === "active") || null;
+}
+function programDef(prog) { return prog ? PROGRAMS[prog.programId] : null; }
+
+// The calendar date a program's (week, day-of-week) slot falls on. week is 1-based.
+function programDate(prog, week, dow) { return addDays(prog.startDate, (week - 1) * 7 + dow); }
+
+// Historical entries are ordinary entries -- a slot's "last week" is found by exerciseId
+// + date, not by any ownership marker, so hand-edits and the program's own output are
+// indistinguishable once written, exactly as intended.
+function programEntryFor(exerciseId, date) {
+  const day = dayFor(date);
+  if (!day) return null;
+  return (state.doc.entries || []).find((e) => e.dayId === day.id && e.exerciseId === exerciseId) || null;
+}
+
+// Whether a program week's last lift day is done with -- either the calendar has moved
+// past it, or every set logged against it has both reps and RIR filled in. Checked
+// against the program's own slots (by exercise + date), not the whole day: an unrelated
+// exercise someone bolted on that day shouldn't hold the program up forever.
+function programWeekComplete(prog, week) {
+  const def = programDef(prog);
+  const lastDow = Math.max(...def.days.map((d) => d.dow));
+  const lastDate = programDate(prog, week, lastDow);
+  if (todayISO() > lastDate) return true;
+  const lastDay = def.days.find((d) => d.dow === lastDow);
+  return lastDay.slots.every((slot) => {
+    const ex = programResolveExercise(slot.exercise);
+    if (!ex) return false;
+    const entry = programEntryFor(ex.id, lastDate);
+    if (!entry) return false;
+    const sets = setsFor(entry.id);
+    return sets.length > 0 && sets.every((s) =>
+      String(s.reps ?? "").trim() !== "" && String(s.rir ?? "").trim() !== "");
+  });
+}
+
+// The set list for one program slot in one week -- weight + rep target per set. Mirrors
+// planSets()'s role for the add-exercise dialog: the one place that decides what a slot
+// *is*, so nothing else has to re-derive it.
+function programPlanSlot(prog, slot, ex, week, date) {
+  if (slot.scheme === "peak") {
+    const oneRM = num(prog.overrides?.[slot.id], 0) || estimatedOneRepMax(ex);
+    return PEAK_REPS.map((reps, i) => ({
+      weight: programPeakWeight(oneRM, week, i), targetReps: String(reps),
+    }));
+  }
+  if (week === 1) {
+    const weight = num(prog.overrides?.[slot.id], 0) || num(ex.defaultWeight, 0);
+    return Array.from({ length: slot.sets }, () => ({ weight, targetReps: String(slot.reps) }));
+  }
+  // Week 6 (test) resumes from week 4, skipping over week 5's deload entirely -- it
+  // isn't "the previous week" the way every other week reads its own -1.
+  const refWeek = week === 6 ? 4 : week - 1;
+  const refDate = addDays(date, -7 * (week - refWeek));
+  const refEntry = programEntryFor(ex.id, refDate);
+  const refSets = refEntry ? setsFor(refEntry.id) : [];
+  const fallback = num(prog.overrides?.[slot.id], 0) || num(ex.defaultWeight, 0);
+  const prevWeight = refSets.length ? num(refSets[0].weight, 0) : fallback;
+  const prevTarget = refSets.length ? String(refSets[0].targetReps ?? slot.reps) : String(slot.reps);
+  const increment = num(ex.increment, PROGRAM_WEEKLY_STATIC_INCREMENT_FALLBACK);
+
+  if (week === 5) {
+    // Deload: hold reps flat, drop a set, cut last week's weight by 25% -- rounded *up*
+    // here specifically (unlike the app's usual floor-to-5), since landing a deload a
+    // plate heavy is the safe side of that rounding, not the risky one.
+    const cutWeight = prevWeight > 0 ? Math.ceil((prevWeight * 0.75) / 5) * 5 : 0;
+    const sets = Math.max(1, slot.sets - 1);
+    return Array.from({ length: sets }, () => ({ weight: cutWeight, targetReps: prevTarget }));
+  }
+  if (week === 6) {
+    // Resumes from week 4 + one increment, sets back to the normal count, unconditionally
+    // -- week 5 was a deliberate dip and doesn't gate this the way a normal week-over-week
+    // bump would.
+    const weight = prevWeight > 0 ? prevWeight + increment : prevWeight;
+    const targetReps = prevWeight > 0 ? prevTarget : String(num(prevTarget, slot.reps) + 2);
+    return Array.from({ length: slot.sets }, () => ({ weight, targetReps }));
+  }
+
+  // Weeks 2-4: progress off the previous week's actual logged performance. A blank RIR
+  // counts as not-0, same rule the library's own rep-max model uses elsewhere.
+  const met = refSets.length > 0 && refSets.every((s) => num(s.reps, -1) >= num(s.targetReps, 0));
+  const noRirZero = refSets.every((s) => String(s.rir ?? "").trim() !== "0");
+  let weight = prevWeight, targetReps = prevTarget;
+  if (met && noRirZero) {
+    if (prevWeight > 0) weight = prevWeight + increment;
+    else targetReps = String(num(prevTarget, slot.reps) + 2);
+  }
+  return Array.from({ length: refSets.length || slot.sets }, () => ({ weight, targetReps }));
+}
+
+// Writes one program week's days/entries/sets. Never overwrites: a slot whose date
+// already has an entry for that exercise is left alone and, past week 1, noted as a
+// conflict rather than silently skipped.
+function generateProgramWeek(prog, week) {
+  const def = programDef(prog);
+  if (!def || week > def.weeks) return;
+  const ops = [];
+  const conflicts = [];
+  const orderByDay = {};
+  for (const day of def.days) {
+    const date = programDate(prog, week, day.dow);
+    for (const slot of day.slots) {
+      const ex = programResolveExercise(slot.exercise);
+      if (!ex) { conflicts.push(`${date}: "${slot.exercise}" isn't in the Library`); continue; }
+      if (programEntryFor(ex.id, date)) {
+        // Week 1 landing on dates that already carry logged sets is the point (that's
+        // what "seeds from what's already there" means), not a conflict.
+        if (week > 1) conflicts.push(`${date}: ${ex.name} already has an entry -- left as is`);
+        continue;
+      }
+      const rows = programPlanSlot(prog, slot, ex, week, date);
+      let dayRow = dayFor(date);
+      if (!dayRow) {
+        dayRow = { id: dayIdFor(date), date, type: "lift", note: "" };
+        ops.push({ op: "upsert", coll: "days", value: dayRow });
+        orderByDay[dayRow.id] = 0;
+      } else {
+        if (dayRow.type !== "lift") ops.push({ op: "patch", coll: "days", id: dayRow.id, fields: { type: "lift" } });
+        if (!(dayRow.id in orderByDay)) orderByDay[dayRow.id] = nextEntryOrder(dayRow.id);
+      }
+      const entryId = uid("en");
+      const order = orderByDay[dayRow.id]++;
+      ops.push({ op: "upsert", coll: "entries", value: {
+        id: entryId, dayId: dayRow.id, exerciseId: ex.id, name: ex.name,
+        scheme: slot.scheme === "peak" ? "peak" : "static", order,
+      } });
+      rows.forEach((row, i) => {
+        ops.push({ op: "upsert", coll: "sets", value: {
+          id: uid("st"), entryId, index: i, weight: row.weight, unit: ex.unit || "lb",
+          targetReps: row.targetReps, reps: "", rir: "",
+        } });
+      });
+    }
+  }
+  const fields = { weeksGenerated: week };
+  if (conflicts.length) fields.conflicts = [...(prog.conflicts || []), ...conflicts];
+  if (week >= def.weeks) fields.status = "completed";
+  ops.push({ op: "patch", coll: "programs", id: prog.id, fields });
+  return mutate(ops);
+}
+
+// Called on a slow tick (poll(), boot()), not on every render -- this only ever needs to
+// notice once a week, and reading every slot's logged sets on every keystroke would be
+// wasted work for something that fires at most six times over six weeks.
+function maybeAdvanceProgram() {
+  const prog = activeProgram();
+  if (!prog) return;
+  const def = programDef(prog);
+  if (!def || prog.weeksGenerated >= def.weeks) return;
+  if (programWeekComplete(prog, prog.weeksGenerated)) generateProgramWeek(prog, prog.weeksGenerated + 1);
+}
+
+function activateProgram(programId, overrides) {
+  const def = PROGRAMS[programId];
+  if (!def || activeProgram()) return;
+  const prog = {
+    id: uid("pg"), programId, status: "active",
+    startDate: weekStartOf(todayISO()), weeksGenerated: 0,
+    overrides: { ...overrides }, conflicts: [],
+  };
+  return mutate([{ op: "upsert", coll: "programs", value: prog }]).then(() => {
+    const fresh = (state.doc.programs || []).find((p) => p.id === prog.id) || prog;
+    return generateProgramWeek(fresh, 1);
+  });
+}
+
+// ===========================================================================
+// Rendering
+// ===========================================================================
+function render() {
+  const keep = captureFocus();
+  const scroll = document.querySelector("main").scrollTop;
+  renderTabs();
+  $("#weekbar").hidden = state.view !== "week";
+  if (state.view === "week") {
+    renderWeekBar();
+    $("#view").innerHTML = renderWeek();
+    wireWeek();
+  } else if (state.view === "library") {
+    $("#view").innerHTML = renderLibrary();
+    wireLibrary();
+  } else {
+    $("#view").innerHTML = renderProgram();
+    wireProgram();
+  }
+  document.querySelector("main").scrollTop = scroll;
+  restoreFocus(keep);
+}
+
+function renderTabs() {
+  $("#tabs").innerHTML = VIEWS.map((v) =>
+    `<button data-view="${v.id}"${v.id === state.view ? ' class="active"' : ""}>${esc(v.label)}</button>`
+  ).join("");
+}
+
+/**
+ * Whole-view innerHTML redraws are what keep this app small, but they throw away the
+ * caret — and every redraw here happens *while someone is typing a rep count*. So each
+ * editable field carries a stable key, and focus plus selection is restored onto the
+ * field with the same key after the redraw. Same problem House Tracker solves in its
+ * drawer, same solution, applied to the grid instead.
+ */
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el || !el.dataset || !el.dataset.fkey) return null;
+  return { key: el.dataset.fkey, start: el.selectionStart, end: el.selectionEnd };
+}
+function restoreFocus(keep) {
+  if (!keep) return;
+  const el = document.querySelector(`[data-fkey="${CSS.escape(keep.key)}"]`);
+  if (!el) return;
+  el.focus();
+  try { el.setSelectionRange(keep.start, keep.end); } catch { /* selects have no range */ }
+}
+
+// ---- Week bar --------------------------------------------------------------
+function renderWeekBar() {
+  const dates = weekDates(state.weekStart);
+  const end = dates[6];
+  $("#wk-label").textContent = fmtDate(state.weekStart) + " – " + fmtDate(end) +
+    (state.weekStart.slice(0, 4) === todayISO().slice(0, 4) ? "" : ", " + end.slice(0, 4));
+
+  let lifts = 0, exercises = 0, logged = 0, total = 0;
+  for (const date of dates) {
+    if (dayType(date) !== "lift") continue;
+    lifts++;
+    for (const entry of entriesFor(dayFor(date).id)) {
+      exercises++;
+      for (const s of setsFor(entry.id)) {
+        total++;
+        if (String(s.reps).trim() !== "") logged++;
+      }
+    }
+  }
+  $("#week-summary").textContent = lifts
+    ? `${lifts} lift day${lifts === 1 ? "" : "s"} · ${exercises} exercise${exercises === 1 ? "" : "s"} · ${logged}/${total} sets logged`
+    : "no lift days this week";
+}
+
+// ---- Week grid -------------------------------------------------------------
+function renderWeek() {
+  if (!(state.doc?.exercises || []).length) {
+    return `<div class="empty"><p><strong>No exercises in the library yet.</strong></p>
+      <p>Add a movement or two on the <a href="#library">Library</a> tab, then come back
+      and put them on a day.</p></div>`;
+  }
+  return `<div id="week">${weekDates(state.weekStart).map(dayHTML).join("")}</div>`;
+}
+
+function dayHTML(date) {
+  const today = date === todayISO();
+  const type = dayType(date);
+  const day = dayFor(date);
+  const dow = DOW[(new Date(dateToNum(date)).getUTCDay() + 6) % 7];
+  const head = `<div class="day-head">
+      <span class="day-dow">${dow}</span>
+      <span class="day-date">${esc(fmtDate(date))}${today ? " · today" : ""}</span>
+      <span class="spacer"></span>
+      <span class="badge ${type}" data-toggle-day="${esc(date)}"
+            title="${type === "lift" ? "Switch to a rest day" : "Switch to a lift day"}"
+            role="button" tabindex="0">${type}</span>
+    </div>`;
+
+  if (type !== "lift") {
+    return `<section class="day rest${today ? " today" : ""}" data-day="${esc(date)}">
+      ${head}
+      <div class="day-rest-body">
+        <span class="txt">Nothing planned.</span>
+        <button class="small" data-make-lift="${esc(date)}">＋ Lift day</button>
+      </div></section>`;
+  }
+
+  const entries = entriesFor(day.id);
+  return `<section class="day${today ? " today" : ""}" data-day="${esc(date)}">
+    ${head}
+    <div class="day-body">
+      ${entries.length
+        ? entries.map((entry, i) => entryHTML(entry, i, entries.length)).join("")
+        : `<div class="day-empty-note">No exercises yet — pick one below.</div>`}
+      <div class="day-foot">
+        <select data-add-to="${esc(date)}">
+          <option value="">＋ Add exercise…</option>
+          ${sortedExercises().map((e) =>
+            `<option value="${esc(e.id)}">${esc(e.name)}</option>`).join("")}
+          <option value="__new">＋ New movement…</option>
+        </select>
+      </div>
+    </div></section>`;
+}
+
+function entryHTML(entry, index, count) {
+  const sets = setsFor(entry.id);
+  const open = state.expanded.has(entry.id);
+  const scheme = schemeOf(entry);
+  const logged = sets.filter((s) => String(s.reps).trim() !== "").length;
+  // Sorted numerically, not by the order the sets happen to sit in: a session that ran
+  // 155 / 135 / 145 reads "135–155 lb", never "155–145 lb".
+  const nums = [...new Set(sets.map((s) => num(s.weight, 0)))].sort((a, b) => a - b);
+  const unit = sets[0]?.unit || "lb";
+  const weightText = nums.length === 1 ? `${fmtWeight(nums[0])} ${unit}`
+    : nums.length ? `${fmtWeight(nums[0])}–${fmtWeight(nums[nums.length - 1])} ${unit}` : "";
+  const summary = `${logged}/${sets.length} · ${weightText}`;
+
+  return `<article class="entry${open ? " open" : ""}" data-entry="${esc(entry.id)}">
+    <div class="entry-head" data-toggle-entry="${esc(entry.id)}" role="button" tabindex="0"
+         aria-expanded="${open}">
+      <span class="entry-move">
+        <button class="small" data-move-entry="${esc(entry.id)}" data-dir="-1"
+                ${index === 0 ? "disabled" : ""} title="Move up"
+                aria-label="Move ${esc(entry.name)} up">▲</button>
+        <button class="small" data-move-entry="${esc(entry.id)}" data-dir="1"
+                ${index === count - 1 ? "disabled" : ""} title="Move down"
+                aria-label="Move ${esc(entry.name)} down">▼</button>
+      </span>
+      <span class="caret">▶</span>
+      <span class="ex-name">${esc(entry.name)}</span>
+      ${scheme === "static" ? "" : `<span class="scheme">${esc(SCHEME_LABEL[scheme])}</span>`}
+      <span class="ex-sum${logged && logged === sets.length ? " done" : ""}">${esc(summary)}</span>
+    </div>
+    <div class="entry-sets">
+      ${sets.map((s, i) => setHTML(s, i)).join("")}
+      <div class="set-add">
+        <button class="small ghost" data-add-set="${esc(entry.id)}">＋ Set</button>
+        <span class="spacer" style="flex:1"></span>
+        <button class="small ghost danger" data-del-entry="${esc(entry.id)}">Remove exercise</button>
+      </div>
+    </div>
+  </article>`;
+}
+
+function setHTML(s, i) {
+  const done = String(s.reps).trim() !== "";
+  const target = String(s.targetReps ?? "").trim();
+  // The target is a note on the box, not a second editable number: it says what the
+  // scheme asked for, and the box next to it says what happened. A set that came from
+  // before schemes existed has no target and simply doesn't show one.
+  const tgt = target
+    ? `<span class="tgt" title="Target: ${esc(target)} reps">/${esc(target)}</span>`
+    : `<span class="tgt"></span>`;
+  return `<div class="set-row${done ? " logged" : ""}" data-set="${esc(s.id)}">
+    <span class="n">${i + 1}</span>
+    <input class="w" type="text" inputmode="decimal" data-w="${esc(s.id)}"
+           data-fkey="w:${esc(s.id)}" value="${esc(fmtWeight(s.weight))}"
+           aria-label="Set ${i + 1} weight">
+    <span class="unit">${esc(s.unit || "lb")}</span>
+    <span class="x">×</span>
+    <input class="r" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2"
+           data-r="${esc(s.id)}" data-fkey="r:${esc(s.id)}" placeholder="––"
+           value="${esc(s.reps ?? "")}"
+           aria-label="Set ${i + 1} reps performed${target ? ", target " + esc(target) : ""}">
+    ${tgt}
+    <button class="small ghost bump" data-bump="reps" data-bump-id="${esc(s.id)}"
+            title="+1 rep" aria-label="Add one rep to set ${i + 1}">+</button>
+    <span class="rl">reps</span>
+    <span class="rl-gap"></span>
+    <input class="rir" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="1"
+           data-rir="${esc(s.id)}" data-fkey="rir:${esc(s.id)}" placeholder="–"
+           value="${esc(s.rir ?? "")}" title="Reps in reserve — how many more you had in you"
+           aria-label="Set ${i + 1} reps in reserve">
+    <button class="small ghost bump" data-bump="rir" data-bump-id="${esc(s.id)}"
+            title="+1 RIR" aria-label="Add one to RIR for set ${i + 1}">+</button>
+    <span class="rirl">RIR</span>
+    <button class="small ghost del" data-del-set="${esc(s.id)}" title="Remove this set">×</button>
+  </div>`;
+}
+
+function wireWeek() {
+  $$("[data-toggle-day]").forEach((el) => {
+    const go = () => setDayType(el.dataset.toggleDay,
+      dayType(el.dataset.toggleDay) === "lift" ? "rest" : "lift");
+    el.onclick = go;
+    el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+  });
+  $$("[data-make-lift]").forEach((el) => {
+    el.onclick = () => setDayType(el.dataset.makeLift, "lift");
+  });
+  $$("[data-toggle-entry]").forEach((el) => {
+    const id = el.dataset.toggleEntry;
+    const go = () => {
+      state.expanded.has(id) ? state.expanded.delete(id) : state.expanded.add(id);
+      render();
+    };
+    el.onclick = go;
+    el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+  });
+  $$("[data-move-entry]").forEach((el) => {
+    // stopPropagation, not just the button's own handler: the entry-head div this sits
+    // inside toggles open/closed on click, and a move shouldn't also flip that.
+    el.onclick = (e) => { e.stopPropagation(); moveEntry(el.dataset.moveEntry, +el.dataset.dir); };
+  });
+  $$("[data-add-set]").forEach((el) => { el.onclick = () => addSet(el.dataset.addSet); });
+  $$("[data-del-set]").forEach((el) => { el.onclick = () => remove("sets", el.dataset.delSet); });
+  // +1 taps for reps and RIR: empty reads as "start at 0", after that each tap adds one,
+  // capped the same as typing would be. Reads the authoritative value out of state.doc
+  // rather than the input's live DOM value, and flushes any pending debounced keystroke
+  // first, so a tap right after typing can't be clobbered when that stale save lands.
+  $$("[data-bump]").forEach((el) => {
+    el.onclick = () => {
+      const field = el.dataset.bump, cap = field === "rir" ? MAX_RIR : MAX_REPS;
+      flushSaves();
+      const s = (state.doc.sets || []).find((x) => x.id === el.dataset.bumpId);
+      if (!s) return;
+      const current = String(s[field] ?? "").trim();
+      const next = current === "" ? "0" : String(Math.min(cap, num(current, 0) + 1));
+      patch("sets", s.id, { [field]: next });
+    };
+  });
+  $$("[data-del-entry]").forEach((el) => {
+    el.onclick = () => {
+      const entry = state.doc.entries.find((x) => x.id === el.dataset.delEntry);
+      if (entry && confirm(`Remove ${entry.name} and its sets?`)) remove("entries", entry.id);
+    };
+  });
+
+  $$("[data-add-to]").forEach((sel) => {
+    sel.onchange = () => {
+      const date = sel.dataset.addTo, value = sel.value;
+      sel.value = "";
+      if (!value) return;
+      if (value === "__new") {
+        const id = newExercise(window.prompt("Name of the movement"));
+        if (id) openAddExercise(date, id);
+        return;
+      }
+      openAddExercise(date, value);
+    };
+  });
+
+  // Weight: free text so "137.5" can be typed a character at a time without the field
+  // fighting back, parsed on the way to the server.
+  $$("[data-w]").forEach((el) => {
+    const id = el.dataset.w;
+    const commit = () => patch("sets", id, { weight: num(el.value, 0) });
+    el.oninput = () => saveLater("w:" + id, commit);
+    el.onchange = () => { flushSaves(); commit(); };
+  });
+
+  // Reps and RIR are the same kind of box -- a short digits-only field that saves as you
+  // type -- so they are wired by the same function. Non-digits are dropped as they're
+  // typed rather than rejected on save, so a fat-fingered "8k" doesn't quietly store
+  // nothing.
+  const digitBox = (attr, key, maxDigits, cap) => $$(`[data-${attr}]`).forEach((el) => {
+    const id = el.dataset[attr];
+    const clean = () => {
+      const digits = el.value.replace(/\D+/g, "").slice(0, maxDigits);
+      if (digits !== el.value) el.value = digits;
+      return digits === "" ? "" : String(Math.min(cap, +digits));
+    };
+    el.oninput = () => { const v = clean(); saveLater(`${attr}:${id}`, () => patch("sets", id, { [key]: v })); };
+    el.onchange = () => { const v = clean(); flushSaves(); patch("sets", id, { [key]: v }); };
+    el.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); advance(el); } };
+  });
+
+  // Enter walks the logging boxes in the order they sit on screen -- this set's reps,
+  // this set's RIR, then the next set. Logging a workout is a run down that column, and
+  // reaching for the next box by hand between sets is the friction that stops people
+  // logging at all. RIR is on the same run rather than a separate pass because you know
+  // how many you had left at the moment you finish the set, not ten minutes later.
+  const advance = (el) => {
+    const boxes = $$("[data-r], [data-rir]");
+    const next = boxes[boxes.indexOf(el) + 1];
+    el.blur();
+    if (next) { next.focus(); next.select(); }
+  };
+
+  digitBox("r", "reps", 2, MAX_REPS);
+  digitBox("rir", "rir", 1, MAX_RIR);
+}
+
+// ---- Add-exercise dialog ---------------------------------------------------
+//
+// Picking a movement used to be the whole decision, and the sets fell out of the library
+// row. A scheme is a second decision that can't be defaulted away -- five sets waving up
+// to a double is a different session from three sets of eight -- so it gets asked, once,
+// at the point of adding. The dialog previews what it will create by calling the same
+// planSets() that creates it, so there is no second description of a scheme to keep in
+// step with the first.
+const addDraft = { date: null, exerciseId: null, scheme: "static", sets: 3, reps: 8, weight: "" };
+
+function openAddExercise(date, exerciseId) {
+  const ex = exerciseById(exerciseId);
+  if (!ex) return;
+  addDraft.date = date;
+  addDraft.exerciseId = exerciseId;
+  addDraft.scheme = "static";
+  // All three default to "what you did last time", the same rule the weight suggestion
+  // follows elsewhere: the library's set count, the rep target and the weight of the last
+  // session -- or the library's own max weight for a movement with no history yet.
+  addDraft.sets = Math.max(1, Math.min(MAX_SCHEME_SETS, num(ex.defaultSets, 3)));
+  addDraft.reps = suggestTargetReps(exerciseId, date);
+  addDraft.weight = fmtWeight(suggestWeight(exerciseId, date, 0));
+  renderAddExercise();
+}
+
+function closeAddExercise() {
+  const modal = $("#add-modal");
+  modal.hidden = true;
+  modal.innerHTML = "";
+}
+
+function renderAddExercise() {
+  const ex = exerciseById(addDraft.exerciseId);
+  if (!ex) return closeAddExercise();
+  const modal = $("#add-modal");
+  const wasFocused = document.activeElement?.dataset?.addField;
+  const caret = document.activeElement?.selectionStart;
+  const isPeak = addDraft.scheme === "peak";
+  const rows = planSets(ex, addDraft.date, addDraft);
+  const max = estimatedOneRepMax(ex);
+
+  modal.hidden = false;
+  modal.innerHTML = `<div class="fb-box" style="width:min(400px,100%)">
+    <h3>Add ${esc(ex.name)}</h3>
+    <p style="font-size:.75rem;color:var(--muted);margin:.1rem 0 .5rem">
+      ${esc(fmtDate(addDraft.date))} · max weight ${esc(fmtWeight(max))} ${esc(ex.unit || "lb")}
+      · 1 pip = ${esc(fmtPip(max))} ${esc(ex.unit || "lb")}</p>
+    <div class="seg" id="add-seg">
+      <button data-scheme="static"${isPeak ? "" : ' class="active"'}>
+        <span class="t">Static</span><span class="d">Same reps, same weight</span></button>
+      <button data-scheme="peak"${isPeak ? ' class="active"' : ""}>
+        <span class="t">Peak</span><span class="d">5·4·2·4·5 off the max</span></button>
+    </div>
+    ${isPeak ? "" : `<div class="add-fields">
+      <label class="field">Weight (${esc(ex.unit || "lb")})
+        <input type="text" inputmode="decimal" style="width:4.6rem" data-add-field="weight"
+               value="${esc(addDraft.weight)}"></label>
+      <label class="field">Sets
+        <input type="text" inputmode="numeric" maxlength="1" data-add-field="sets"
+               value="${esc(addDraft.sets)}"></label>
+      <label class="field">Reps
+        <input type="text" inputmode="numeric" maxlength="2" data-add-field="reps"
+               value="${esc(addDraft.reps)}"></label>
+    </div>`}
+    <div class="add-preview">
+      <div class="hd">${rows.length} set${rows.length === 1 ? "" : "s"}</div>
+      <ol>${rows.map((r, i) => `<li><span class="i">${i + 1}</span>` +
+        `<span class="wt">${esc(fmtWeight(r.weight))} ${esc(ex.unit || "lb")}</span>` +
+        `<span class="rp">× ${esc(r.targetReps)} reps</span></li>`).join("")}</ol>
+      ${isPeak && max <= 0 ? `<p class="warn-note">${esc(ex.name)} has no max weight in the
+        library, so every rung comes out at 0. Set one on the Library tab, or fill the
+        weights in by hand.</p>` : ""}
+    </div>
+    <div class="fb-actions">
+      <button class="primary" id="add-go">Add</button>
+      <button id="add-cancel">Cancel</button>
+    </div>
+  </div>`;
+
+  $("#add-seg").onclick = (e) => {
+    const b = e.target.closest("[data-scheme]");
+    if (!b || b.dataset.scheme === addDraft.scheme) return;
+    addDraft.scheme = b.dataset.scheme;
+    renderAddExercise();
+  };
+  // The preview redraws on every keystroke, so the fields have to hand focus and caret
+  // back afterwards -- the same problem, and the same fix, as the week grid.
+  $$("[data-add-field]").forEach((el) => {
+    el.oninput = () => {
+      const field = el.dataset.addField;
+      // Weight is the one decimal field here -- a plate math like 137.5 needs the dot --
+      // everything else (sets, reps) is whole digits only.
+      let clean = field === "weight"
+        ? el.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1")
+        : el.value.replace(/\D+/g, "");
+      if (clean !== el.value) el.value = clean;
+      // Held as typed, clamped by planSets(), so clearing the box to retype it doesn't
+      // snap to 1 under your fingers.
+      addDraft[field] = clean;
+      renderAddExercise();
+    };
+    el.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); commitAddExercise(); } };
+  });
+  $("#add-cancel").onclick = closeAddExercise;
+  $("#add-go").onclick = commitAddExercise;
+
+  if (wasFocused) {
+    const el = document.querySelector(`[data-add-field="${CSS.escape(wasFocused)}"]`);
+    if (el) { el.focus(); try { el.setSelectionRange(caret, caret); } catch { /* no range */ } }
+  } else {
+    $("#add-go").focus();
+  }
+}
+
+function commitAddExercise() {
+  const { date, exerciseId } = addDraft;
+  closeAddExercise();
+  addExercise(date, exerciseId, { ...addDraft });
+}
+
+// ---- Library ---------------------------------------------------------------
+//
+// The library is a strength table, not a list of defaults. One editable number per
+// movement -- the one-rep max -- and everything else on the row is derived from it: the
+// pip (2.5% of it) and, when the row is open, what that model says you would lift for
+// two reps through twelve. Deriving rather than storing is the point. There is no way
+// for a three-rep max to drift out of step with the single it came from, and no eleven
+// extra boxes per movement to keep honest.
+function renderLibrary() {
+  const rows = sortedExercises();
+  const usage = (id) => (state.doc.entries || []).filter((e) => e.exerciseId === id).length;
+  return `<section class="panel">
+    <h3>Exercise library</h3>
+    <div class="lib-row" style="border-bottom:1px solid var(--border)">
+      <span class="cr"></span>
+      <span class="nm cap">Movement</span><span class="gp cap">Group</span>
+      <span class="rp cap">Rep</span><span class="num cap">Max Wt</span>
+      <span class="pip cap">Pip</span><span class="cap del-col"></span>
+    </div>
+    ${rows.map((e) => libRowHTML(e, usage(e.id))).join("")}
+    <div class="lib-add">
+      <input type="text" id="lib-new" placeholder="New movement — e.g. Front Squat" style="flex:2 1 12rem">
+      <button class="primary" id="lib-add">Add</button>
+    </div>
+    <p class="hint"><strong>Max weight</strong> is the most you can lift for the number of
+      <strong>reps</strong> next to it — leave reps at 1 if it's a genuine one-rep max.
+      Everything else on the row is worked back from those two numbers: a
+      <strong>pip</strong> is 2.5% of the one-rep max they imply, and opening a row shows
+      the rep maxes that follow from it, one pip lighter per rep. Reps past 12 are priced
+      the same as 12 — the model doesn't extrapolate a curve that far, so a 20-rep set is
+      just entered as 20 and treated like a 12-rep one for the math. New sets on a day
+      still start from the last session you did that movement — max weight only seeds a
+      movement with no history yet. Deleting a movement leaves sessions that already used
+      it untouched: the name is copied onto each one when it's added to a day.</p>
+  </section>`;
+}
+
+function libRowHTML(e, used) {
+  const open = state.libExpanded.has(e.id);
+  const g = groupOf(e);
+  return `<div class="lib-row${open ? " open" : ""}" data-ex="${esc(e.id)}">
+    <button class="small cr" data-ex-toggle="${esc(e.id)}"
+            title="${open ? "Hide" : "Show"} rep maxes and notes">${open ? "▾" : "▸"}</button>
+    <input class="nm" type="text" data-fkey="ex-name:${esc(e.id)}" data-ex-name="${esc(e.id)}" value="${esc(e.name)}">
+    <select class="gp mg" style="${groupStyle(g)}" data-ex-group="${esc(e.id)}" title="Muscle group">
+      <option value=""${g ? "" : " selected"}>— group</option>
+      ${MUSCLE_GROUPS.map((m) =>
+        `<option value="${m.id}"${m.id === g?.id ? " selected" : ""}>${esc(m.label)}</option>`).join("")}
+    </select>
+    <input class="rp" type="text" inputmode="numeric" maxlength="2" data-fkey="ex-maxreps:${esc(e.id)}"
+           data-ex-maxreps="${esc(e.id)}" value="${esc(e.maxReps ?? 1)}"
+           title="How many reps Max Weight is good for — 1 if it's a genuine one-rep max. Past 12, it's priced the same as a 12-rep max.">
+    <input class="num" type="text" inputmode="decimal" data-fkey="ex-max:${esc(e.id)}"
+           data-ex-max="${esc(e.id)}" value="${esc(fmtWeight(e.defaultWeight))}"
+           title="The most you can lift for the Reps count on this row">
+    <span class="pip" data-ex-pip="${esc(e.id)}" title="One pip = 2.5% of the estimated one-rep max">${esc(fmtPip(estimatedOneRepMax(e)))}</span>
+    <button class="small ghost danger ex-del" data-ex-del="${esc(e.id)}"
+            title="${used ? `Delete ${e.name} — used on ${used} day(s)` : `Delete ${e.name}`}"
+            aria-label="Delete ${esc(e.name)}">×</button>
+    ${open ? `<div class="lib-reps" data-ex-reps="${esc(e.id)}">${repMaxHTML(e)}</div>
+      <div class="lib-notes-wrap">
+        <label class="field">Notes
+          <textarea class="lib-notes" rows="2" data-fkey="ex-notes:${esc(e.id)}"
+                    data-ex-notes="${esc(e.id)}"
+                    placeholder="Form cues, technique notes…">${esc(e.notes || "")}</textarea>
+        </label>
+      </div>` : ""}
+  </div>`;
+}
+
+// The 2..12 rep maxes for one movement. Twelve rows of arithmetic is more than a glance
+// wants as a table, so they are chips that reflow to however many fit the width.
+function repMaxHTML(e) {
+  const oneRM = estimatedOneRepMax(e);
+  const unit = e.unit || "lb";
+  if (oneRM <= 0) {
+    return `<p class="note">Set a max weight to see the rep maxes it implies.</p>`;
+  }
+  const cells = [];
+  for (let reps = 2; reps <= REP_MAX_MAX; reps++) {
+    cells.push(`<div class="rm"><span class="n">${reps} reps</span>` +
+      `<span class="w">${esc(fmtWeight(repMaxWeight(oneRM, reps)))}</span>` +
+      `<span class="u">${esc(unit)}</span></div>`);
+  }
+  // States the rule rather than working an example: the displayed pip is rounded to one
+  // decimal to match the column, so any sum spelled out here ("3.4 x 12") would land a
+  // few tenths off the exact figures in the chips below and read as a bug.
+  const reps = num(e.maxReps, 1);
+  const basis = reps > 1
+    ? `an estimated ${esc(fmtWeight(oneRM))} ${esc(unit)} one-rep max` +
+      (reps > REP_MAX_MAX ? ` (priced as a ${REP_MAX_MAX}-rep max — ${reps} isn't modeled further)` : "")
+    : `a ${esc(fmtWeight(oneRM))} ${esc(unit)} single`;
+  return `<p class="note">1 pip = ${esc(fmtPip(oneRM))} ${esc(unit)} · one pip lighter per rep, ` +
+    `off ${basis}.</p>` + cells.join("");
+}
+
+function wireLibrary() {
+  const field = (attr, key, parse) => $$(`[data-ex-${attr}]`).forEach((el) => {
+    const id = el.dataset["ex" + attr[0].toUpperCase() + attr.slice(1)];
+    const commit = () => patch("exercises", id, { [key]: parse(el.value) });
+    if (el.tagName === "SELECT") { el.onchange = commit; return; }
+    el.oninput = () => saveLater(`${attr}:${id}`, commit);
+    el.onchange = () => { flushSaves(); commit(); };
+  });
+  field("name", "name", (v) => v.trim() || "Untitled");
+  field("group", "muscleGroup", (v) => v);
+  // Reps itself isn't capped at REP_MAX_MAX (12) -- a set of 20 bodyweight squats is a
+  // real data point. estimatedOneRepMax() is what caps the *model* at 12 reps' worth of
+  // discount, so a 20-rep entry prices the same as a 12-rep one instead of extrapolating
+  // the pip formula out to an ever-lighter, eventually negative, weight.
+  field("maxreps", "maxReps", (v) => Math.max(1, Math.min(MAX_REPS, num(v, 1))));
+  field("max", "defaultWeight", (v) => num(v, 0));
+  field("notes", "notes", (v) => v);
+
+  // The pip and the rep maxes are read off Max Weight and Reps together, and the save
+  // that would redraw them is debounced by 600ms -- long enough for a column to sit
+  // visibly wrong while you type into the box next to it. So they are refreshed on the
+  // keystroke, straight into the DOM, rather than waiting for the round trip to bring
+  // them back. Both fields feed the same estimate, so both get the same live refresh.
+  const refreshDerived = (id, patchEx) => {
+    const ex = { ...exerciseById(id), ...patchEx };
+    const oneRM = estimatedOneRepMax(ex);
+    const pip = document.querySelector(`[data-ex-pip="${CSS.escape(id)}"]`);
+    if (pip) pip.textContent = fmtPip(oneRM);
+    const reps = document.querySelector(`[data-ex-reps="${CSS.escape(id)}"]`);
+    if (reps) reps.innerHTML = repMaxHTML(ex);
+  };
+  $$("[data-ex-max]").forEach((el) => {
+    const id = el.dataset.exMax;
+    const typed = el.oninput;
+    el.oninput = (ev) => { typed(ev); refreshDerived(id, { defaultWeight: num(el.value, 0) }); };
+  });
+  $$("[data-ex-maxreps]").forEach((el) => {
+    const id = el.dataset.exMaxreps;
+    const typed = el.oninput;
+    el.oninput = (ev) => {
+      typed(ev);
+      refreshDerived(id, { maxReps: Math.max(1, Math.min(MAX_REPS, num(el.value, 1))) });
+    };
+  });
+
+  // Colour the chip the moment the group changes, for the same reason: the select's own
+  // change handler saves, and the redraw that recolours it is a network round trip away.
+  $$("[data-ex-group]").forEach((el) => {
+    const saved = el.onchange;
+    el.onchange = (ev) => {
+      el.setAttribute("style", groupStyle(GROUP_BY_ID.get(el.value) || null));
+      saved(ev);
+    };
+  });
+
+  $$("[data-ex-toggle]").forEach((el) => {
+    el.onclick = () => {
+      const id = el.dataset.exToggle;
+      if (state.libExpanded.has(id)) state.libExpanded.delete(id);
+      else state.libExpanded.add(id);
+      render();
+    };
+  });
+
+  $$("[data-ex-del]").forEach((el) => {
+    el.onclick = () => {
+      const ex = exerciseById(el.dataset.exDel);
+      if (ex && confirm(`Delete ${ex.name} from the library? Sessions that used it stay.`)) {
+        state.libExpanded.delete(ex.id);
+        remove("exercises", ex.id);
+      }
+    };
+  });
+  const add = () => {
+    const input = $("#lib-new");
+    if (newExercise(input.value)) input.value = "";
+    input.focus();
+  };
+  $("#lib-add").onclick = add;
+  $("#lib-new").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } };
+}
+
+// ---- Program -----------------------------------------------------------------
+function renderProgram() {
+  const prog = activeProgram();
+  return prog ? renderActiveProgram(prog) : renderProgramCatalog();
+}
+
+function renderProgramCatalog() {
+  return `<div>${Object.values(PROGRAMS).map((def) => `
+    <section class="panel" style="margin-bottom:.6rem">
+      <h3>${esc(def.name)}</h3>
+      <p class="hint" style="margin-top:0">${esc(def.blurb)}</p>
+      <p class="hint">${def.weeks} weeks · ${def.days.length} lift days a week</p>
+      <button class="primary" data-prog-setup="${esc(def.id)}">Start this program</button>
+    </section>`).join("")}
+  </div>`;
+}
+
+function renderActiveProgram(prog) {
+  const def = programDef(prog);
+  return `<section class="panel">
+    <h3>${esc(def.name)}</h3>
+    <p class="hint" style="margin-top:0">${esc(def.blurb)}</p>
+    <p>Week <strong>${prog.weeksGenerated}</strong> of ${def.weeks}${prog.status === "completed" ? " — complete" : ""}
+       · started ${esc(fmtDate(prog.startDate))}</p>
+    ${prog.conflicts?.length ? `<p class="warn-note">${prog.conflicts.length}
+       conflict${prog.conflicts.length === 1 ? "" : "s"} — existing data was never
+       overwritten, just left as is:</p>
+       <ul class="hint" style="margin:0 0 .5rem 1.2rem">
+         ${prog.conflicts.map((c) => `<li>${esc(c)}</li>`).join("")}
+       </ul>` : ""}
+    <div class="prog-slots">
+      ${def.days.map((day) => `<div class="prog-day">
+        <div class="prog-day-label">${esc(DOW[day.dow])}</div>
+        ${day.slots.map((slot) => slotOverrideRowHTML(prog, slot)).join("")}
+      </div>`).join("")}
+    </div>
+    <p class="hint">Adjusting a weight here only changes weeks not yet generated —
+      weeks already written to your log are real logged sets, same as anything you'd
+      type by hand, and this doesn't touch them.</p>
+    ${prog.status === "active"
+      ? `<button class="ghost danger" data-prog-cancel="${esc(prog.id)}">Cancel program</button>`
+      : ""}
+  </section>`;
+}
+
+function slotOverrideRowHTML(prog, slot) {
+  const ex = programResolveExercise(slot.exercise);
+  const isPeak = slot.scheme === "peak";
+  const fallback = ex ? (isPeak ? estimatedOneRepMax(ex) : num(ex.defaultWeight, 0)) : 0;
+  const val = prog.overrides?.[slot.id] ?? fallback;
+  return `<div class="prog-slot">
+    <span class="prog-slot-ex">${esc(slot.exercise)}${isPeak ? ' <span class="scheme">Peak</span>' : ""}</span>
+    <input class="prog-slot-w" type="text" inputmode="decimal" data-prog-override="${esc(slot.id)}"
+           data-prog-id="${esc(prog.id)}" data-fkey="prog-ov:${esc(slot.id)}"
+           value="${esc(fmtWeight(val))}"
+           title="${isPeak ? "One-rep max this program prices its weeks off" : "Starting weight"}">
+    <span class="unit">${esc(ex?.unit || "lb")}</span>
+  </div>`;
+}
+
+function wireProgram() {
+  $$("[data-prog-setup]").forEach((el) => { el.onclick = () => openProgramSetup(el.dataset.progSetup); });
+  $$("[data-prog-cancel]").forEach((el) => {
+    el.onclick = () => {
+      if (confirm("Cancel this program? Weeks already generated stay in your log -- " +
+          "this only stops new ones from being created.")) {
+        patch("programs", el.dataset.progCancel, { status: "cancelled" });
+      }
+    };
+  });
+  $$("[data-prog-override]").forEach((el) => {
+    const slotId = el.dataset.progOverride, progId = el.dataset.progId;
+    const commit = () => {
+      const prog = (state.doc.programs || []).find((p) => p.id === progId);
+      if (!prog) return;
+      patch("programs", progId, { overrides: { ...(prog.overrides || {}), [slotId]: num(el.value, 0) } });
+    };
+    el.oninput = () => saveLater(`prog-ov:${slotId}`, commit);
+    el.onchange = () => { flushSaves(); commit(); };
+  });
+}
+
+// ---- Program setup dialog ------------------------------------------------------
+const programDraft = { programId: null, overrides: {} };
+
+function openProgramSetup(programId) {
+  const def = PROGRAMS[programId];
+  if (!def || activeProgram()) return;
+  programDraft.programId = programId;
+  programDraft.overrides = {};
+  def.days.forEach((day) => day.slots.forEach((slot) => {
+    const ex = programResolveExercise(slot.exercise);
+    const val = ex ? (slot.scheme === "peak" ? estimatedOneRepMax(ex) : num(ex.defaultWeight, 0)) : 0;
+    programDraft.overrides[slot.id] = fmtWeight(val);
+  }));
+  renderProgramSetup();
+}
+
+function closeProgramSetup() {
+  const modal = $("#program-modal");
+  modal.hidden = true;
+  modal.innerHTML = "";
+}
+
+function renderProgramSetup() {
+  const def = PROGRAMS[programDraft.programId];
+  if (!def) return closeProgramSetup();
+  const modal = $("#program-modal");
+  const wasFocused = document.activeElement?.dataset?.progDraft;
+  const caret = document.activeElement?.selectionStart;
+
+  modal.hidden = false;
+  modal.innerHTML = `<div class="fb-box" style="width:min(480px,100%)">
+    <h3>Start ${esc(def.name)}</h3>
+    <p style="font-size:.75rem;color:var(--muted);margin:.1rem 0 .5rem">
+      Starting weights come from the Library by default — adjust any below. Week 1
+      begins ${esc(fmtDate(weekStartOf(todayISO())))}.</p>
+    <div class="prog-slots">
+      ${def.days.map((day) => `<div class="prog-day">
+        <div class="prog-day-label">${esc(DOW[day.dow])}</div>
+        ${day.slots.map((slot) => {
+          const ex = programResolveExercise(slot.exercise);
+          const isPeak = slot.scheme === "peak";
+          return `<div class="prog-slot">
+            <span class="prog-slot-ex">${esc(slot.exercise)}${isPeak ? ' <span class="scheme">Peak</span>' : ""}
+              ${!ex ? '<span class="warn-note">not in Library — this slot will be skipped</span>' : ""}</span>
+            <input class="prog-slot-w" type="text" inputmode="decimal" data-prog-draft="${esc(slot.id)}"
+                   data-fkey="prog-draft:${esc(slot.id)}" value="${esc(programDraft.overrides[slot.id] ?? "")}">
+            <span class="unit">${esc(ex?.unit || "lb")}</span>
+          </div>`;
+        }).join("")}
+      </div>`).join("")}
+    </div>
+    <div class="fb-actions">
+      <button class="primary" id="prog-activate">Activate</button>
+      <button id="prog-setup-cancel">Cancel</button>
+    </div>
+  </div>`;
+
+  $$("[data-prog-draft]").forEach((el) => {
+    el.oninput = () => { programDraft.overrides[el.dataset.progDraft] = el.value; };
+  });
+  $("#prog-setup-cancel").onclick = closeProgramSetup;
+  $("#prog-activate").onclick = () => {
+    const overrides = {};
+    for (const [slotId, v] of Object.entries(programDraft.overrides)) overrides[slotId] = num(v, 0);
+    const programId = programDraft.programId;
+    closeProgramSetup();
+    activateProgram(programId, overrides);
+  };
+
+  if (wasFocused) {
+    const el = document.querySelector(`[data-prog-draft="${CSS.escape(wasFocused)}"]`);
+    if (el) { el.focus(); try { el.setSelectionRange(caret, caret); } catch { /* no range */ } }
+  }
+}
+
+// ===========================================================================
+// Navigation and global wiring
+// ===========================================================================
+function setView(view) {
+  if (!VIEWS.some((v) => v.id === view)) view = "week";
+  state.view = view;
+  localStorage.setItem("lt.view", view);
+  if (location.hash.slice(1) !== view) location.hash = view;
+  render();
+}
+
+function shiftWeek(n) {
+  state.weekStart = addDays(state.weekStart, n * 7);
+  render();
+}
+
+function wireGlobal() {
+  $("#tabs").onclick = (e) => {
+    const b = e.target.closest("[data-view]");
+    if (b) setView(b.dataset.view);
+  };
+  $("#wk-prev").onclick = () => shiftWeek(-1);
+  $("#wk-next").onclick = () => shiftWeek(1);
+  $("#wk-today").onclick = () => { state.weekStart = weekStartOf(todayISO()); render(); };
+  $("#btn-feedback").onclick = openFeedback;
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { closeFeedback(); closeAddExercise(); closeProgramSetup(); return; }
+    // Shortcuts must never fire while someone is typing a weight into a box, or while a
+    // dialog is up -- "f" over the add-exercise dialog would stack the feedback form on
+    // top of a decision that hasn't been taken yet.
+    // matches?. rather than matches: a keydown with nothing focused targets the document,
+    // which is not an Element and has no matches() to call.
+    if (e.target.matches?.("input, select, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (!$("#add-modal").hidden || !$("#fb-modal").hidden || !$("#program-modal").hidden) return;
+    if (e.key === "f") { e.preventDefault(); openFeedback(); }
+    else if (e.key === "[" && state.view === "week") shiftWeek(-1);
+    else if (e.key === "]" && state.view === "week") shiftWeek(1);
+  });
+}
+
+// ===========================================================================
+// Feedback capture
+//
+// Posts to this repo's Lift Tracker Feedback Desk (feedback-desk/, port 8441) running on the same
+// machine as this app's own server. The value isn't the form — it's the context block
+// attached to it. "The weights are wrong" is close to unactionable; the same sentence
+// with the week on screen, which rows were expanded, the data revision and any
+// JavaScript errors that had fired is usually enough to reproduce from. Nobody types
+// that by hand, so the page does.
+//
+// The desk is optional: if it isn't running, the report is handed back as markdown to
+// paste somewhere rather than being lost.
+// ===========================================================================
+const FEEDBACK_PORT = 8441;
+const feedbackUrl = () => `${location.protocol}//${location.hostname}:${FEEDBACK_PORT}`;
+
+// A short ring buffer of anything the page threw. Registered at parse time, before boot()
+// runs, so an error during startup is still caught.
+const recentErrors = [];
+const noteError = (kind, detail) => {
+  recentErrors.push({ kind, detail: String(detail).slice(0, 400), at: new Date().toISOString() });
+  if (recentErrors.length > 10) recentErrors.shift();
+};
+window.addEventListener("error", (e) =>
+  noteError("error", `${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`));
+window.addEventListener("unhandledrejection", (e) =>
+  noteError("unhandledrejection", e.reason?.message || e.reason));
+
+function feedbackContext() {
+  const dates = state.weekStart ? weekDates(state.weekStart) : [];
+  return {
+    source: "lift-tracker",
+    capturedAt: new Date().toISOString(),
+    url: location.href,
+    view: state.view,
+    weekStart: state.weekStart,
+    weekTypes: dates.map((d) => `${d}:${dayType(d)}`),
+    expandedEntries: [...state.expanded],
+    viewport: `${window.innerWidth}x${window.innerHeight}`,
+    userAgent: navigator.userAgent,
+    appRev: state.rev,
+    counts: {
+      exercises: (state.doc?.exercises || []).length,
+      days: (state.doc?.days || []).length,
+      entries: (state.doc?.entries || []).length,
+      sets: (state.doc?.sets || []).length,
+    },
+    errors: recentErrors.slice(),
+  };
+}
+
+function openFeedback() {
+  const ctx = feedbackContext();
+  const modal = $("#fb-modal");
+  modal.hidden = false;
+  modal.innerHTML = `<div class="fb-box">
+    <h3>Report something about Lift Tracker</h3>
+    <p style="font-size:.75rem;color:var(--muted);margin:.1rem 0 0">
+      Goes to the Lift Tracker Feedback Desk, with what you were looking at attached.</p>
+    <div class="fb-grid">
+      <label class="field">Type<select id="fb-type">
+        ${[["bug", "bug"], ["feature", "new feature"], ["polish", "polish"], ["question", "question"]]
+          .map(([v, label]) => `<option value="${v}">${label}</option>`).join("")}</select></label>
+      <label class="field">Severity<select id="fb-sev">
+        ${["high", "low"].map((v) =>
+          `<option value="${v}"${v === "low" ? " selected" : ""}>${v}</option>`).join("")}</select></label>
+    </div>
+    <label class="field">Title
+      <input type="text" id="fb-title" placeholder="One line — the thing itself"></label>
+    <label class="field" style="margin-top:.45rem">What happened
+      <textarea id="fb-what" rows="3" placeholder="What you saw."></textarea></label>
+    <label class="field" style="margin-top:.45rem">What you expected (optional)
+      <textarea id="fb-expected" rows="2"></textarea></label>
+    <div class="fb-ctx">attaching: ${esc(JSON.stringify(ctx, null, 1).slice(0, 600))}</div>
+    <div class="fb-actions">
+      <button class="primary" id="fb-send">Send</button>
+      <button id="fb-cancel">Cancel</button>
+      <span id="fb-msg" style="font-size:.75rem;color:var(--muted)"></span>
+    </div>
+  </div>`;
+  $("#fb-cancel").onclick = closeFeedback;
+  $("#fb-send").onclick = () => sendFeedback(ctx);
+  $("#fb-title").focus();
+  $("#fb-title").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); sendFeedback(ctx); }
+  });
+}
+
+function closeFeedback() { $("#fb-modal").hidden = true; }
+
+async function sendFeedback(ctx) {
+  const title = $("#fb-title").value.trim();
+  if (!title) { $("#fb-msg").textContent = "A title is required."; $("#fb-title").focus(); return; }
+  const payload = {
+    title, app: "lift-tracker",
+    // The current view is the most accurate "area" available and costs the reporter
+    // nothing; it's editable later in the desk.
+    area: state.view,
+    type: $("#fb-type").value, severity: $("#fb-sev").value,
+    what: $("#fb-what").value, expected: $("#fb-expected").value,
+    context: ctx,
+  };
+  $("#fb-msg").textContent = "Sending…";
+  try {
+    const res = await fetch(feedbackUrl() + "/api/capture", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (!res.ok || !body.ok) throw new Error(body.error || "HTTP " + res.status);
+    $("#fb-msg").textContent = `Captured ${body.item.id}.`;
+    setTimeout(closeFeedback, 900);
+  } catch (e) {
+    // Never lose what someone took the trouble to write: hand it back as the markdown the
+    // desk would have stored, ready to paste into the desk later or straight to Claude.
+    const md = [`### ${title}`, "", `- app: lift-tracker / ${payload.area}`,
+      `- type: ${payload.type} · severity: ${payload.severity}`, "",
+      "**What happened**", payload.what || "—", "",
+      "**Expected**", payload.expected || "—", "",
+      "**Context**", "```json", JSON.stringify(ctx, null, 2), "```"].join("\n");
+    $("#fb-modal").innerHTML = `<div class="fb-box">
+      <h3>Couldn't reach the Lift Tracker Feedback Desk</h3>
+      <p style="font-size:.78rem;color:var(--muted)">${esc(e.message)} — is it running?
+        <code>./feedback-desk/server/start-server.sh</code><br>
+        Here's your report; copy it so it isn't lost.</p>
+      <textarea rows="12" id="fb-fallback" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:.72rem">${esc(md)}</textarea>
+      <div class="fb-actions"><button class="primary" id="fb-close2">Close</button></div>
+    </div>`;
+    $("#fb-close2").onclick = closeFeedback;
+    $("#fb-fallback").select();
+  }
+}
+
+// ===========================================================================
+// Boot
+// ===========================================================================
+async function boot() {
+  state.weekStart = weekStartOf(todayISO());
+  const wanted = location.hash.slice(1) || localStorage.getItem("lt.view");
+  if (VIEWS.some((v) => v.id === wanted)) state.view = wanted;
+  window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
+  wireGlobal();
+  try {
+    const ping = await apiGet("/api/ping");
+    if (!ping || ping.server !== "lift-tracker") throw new Error("unexpected server");
+    await loadState();
+    state.online = true;
+    setPill("ok", "Connected");
+    setView(state.view);
+    maybeAdvanceProgram();
+  } catch (e) {
+    setPill("bad", "No server");
+    $("#weekbar").hidden = true;
+    $("#view").innerHTML = `<div class="empty">
+      <p><strong>Can't reach the Lift Tracker server.</strong></p>
+      <p>This page needs it — it's where the shared training log lives. On the machine
+         holding the data, run:</p>
+      <p><code>./server/start-server.sh</code></p>
+      <p>then open the address it prints from any device on the same WiFi.</p>
+      <p style="color:var(--faint);font-size:.8rem">(${esc(e.message)})</p></div>`;
+  }
+  setInterval(poll, 4000);
+}
+
+boot();
+</script>
+</body>
+</html>
