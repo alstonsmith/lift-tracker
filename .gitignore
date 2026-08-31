@@ -1,0 +1,18 @@
+.DS_Store
+
+# Unanchored patterns (no leading/embedded slash) match at any depth, so these cover both
+# apps' server directories rather than only the repo-root one.
+__pycache__/
+.server.pid
+server.log
+
+# Rolling backups and archived feedback: recoverable local history, not source.
+data/backups/
+data/.lift-tracker.*.tmp
+feedback-desk/data/archive/
+
+# Feedback Desk unattended queue runner (feedback-desk/autorun/).
+feedback-desk/autorun/logs/*
+!feedback-desk/autorun/logs/.gitkeep
+feedback-desk/autorun/.run.lock/
+feedback-desk/autorun/DIGEST.md
