@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Canonical copy. install.sh substitutes the __PLACEHOLDER__ tokens for this
+  machine's real paths and writes the result to
+  ~/Library/LaunchAgents/com.lift-tracker.feedback-queue.plist, then loads it.
+  Edit this file, not the installed one, and re-run install.sh.
+
+  Fires lift-tracker-feedback-queue.sh every day at 22:00 local time (10pm EDT while
+  daylight saving is in effect, 10pm EST otherwise -- launchd's calendar interval is
+  wall-clock local time, so this needs no seasonal adjustment). If the Mac is asleep
+  at 22:00, launchd runs it once on the next wake.
+
+  ProgramArguments points at the script directly rather than "/bin/bash <script>" on
+  purpose: macOS's Background Task Management (what System Settings -> Login Items &
+  Extensions reads) names an unbundled launchd agent after argv[0]'s executable, not
+  its Label -- with "/bin/bash" as argv[0] every bash-based agent on the machine shows
+  up there as indistinguishable "bash" entries. Running the script itself (its shebang
+  still resolves it through bash) makes that list show this agent's own filename.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lift-tracker.feedback-queue</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RUN_QUEUE_SH__</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>22</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>CLAUDE_BIN</key>
+    <string>__HOME__/.local/bin/claude</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/launchd.err</string>
+
+  <key>ProcessType</key>
+  <string>Standard</string>
+</dict>
+</plist>
