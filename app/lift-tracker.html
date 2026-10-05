@@ -341,9 +341,9 @@
 
   /* Overlays: the feedback form and the add-exercise dialog. Same shell, since they are
      the same thing -- a panel over the page that takes focus until it's answered. */
-  #fb-modal, #add-modal, #program-modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
+  #fb-modal, #add-modal, #program-modal, #copy-modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
     justify-content: center; padding: 1rem; background: rgba(0,0,0,.35); }
-  #fb-modal[hidden], #add-modal[hidden], #program-modal[hidden] { display: none; }
+  #fb-modal[hidden], #add-modal[hidden], #program-modal[hidden], #copy-modal[hidden] { display: none; }
   .fb-box { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     box-shadow: var(--shadow); width: min(520px, 100%); max-height: 90vh; overflow-y: auto; padding: .8rem; }
   .fb-box h3 { margin: 0 0 .2rem; font-size: .95rem; }
@@ -379,6 +379,16 @@
   .add-preview li .wt { width: 4.6rem; text-align: right; }
   .add-preview li .rp { color: var(--muted); }
   .add-preview .warn-note { font-size: .7rem; color: var(--warn); margin: .25rem 0 0; }
+
+  /* ---- copy-day dialog ---- */
+  .copy-rows { display: flex; flex-direction: column; gap: .5rem; margin: .5rem 0; }
+  .copy-row { border: 1px solid var(--border); border-radius: 8px; padding: .4rem .55rem; }
+  .copy-row.missing { color: var(--faint); display: flex; align-items: center; gap: .4rem; }
+  .copy-row-head { display: flex; align-items: center; gap: .4rem; font-size: .85rem; }
+  .copy-row-head .nm { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+  .copy-row-fields { display: flex; align-items: center; gap: .3rem; margin: .35rem 0 0 1.6rem;
+    font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .copy-row-fields input { width: 2.2rem; text-align: right; }
   .fb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; margin: .5rem 0; }
   .fb-box textarea { width: 100%; resize: vertical; font-family: inherit; }
   .fb-actions { display: flex; gap: .4rem; align-items: center; margin-top: .6rem; }
@@ -440,6 +450,7 @@
 <div id="fb-modal" hidden></div>
 <div id="add-modal" hidden></div>
 <div id="program-modal" hidden></div>
+<div id="copy-modal" hidden></div>
 
 <script>
 "use strict";
@@ -777,7 +788,15 @@ function safeRender() {
 async function mutate(ops) {
   if (!state.doc) return;
   applyOpsLocal(state.doc, ops);
-  safeRender();
+  // Deferred a tick: this is very often called from a field's own onchange, mid-blur, with
+  // the browser already in the middle of handing focus to whatever was tapped or Enter'd
+  // next. Rendering synchronously here replaces that element's DOM node before the focus
+  // transfer lands, so the tap appears to do nothing and the box the user is mid-logging
+  // on doesn't get the keystrokes until a second tap (fb-0050). Letting this task finish
+  // first means the native focus change has already happened by the time we redraw, so
+  // restoreFocus() below picks up the field actually being typed into, not the one that
+  // just blurred.
+  queueMicrotask(safeRender);
   state.pending++;
   setPill("warn", "Saving…");
   try {
@@ -1335,10 +1354,17 @@ function dayHTML(date) {
     </div>`;
 
   if (type !== "lift") {
+    // Copying only ever reads one week back, by design -- it's "redo what I did last
+    // time I was here," not a generic day-picker. A source day with no exercises isn't
+    // worth offering: there would be nothing in the dialog to copy.
+    const priorDate = addDays(date, -7);
+    const canCopy = dayType(priorDate) === "lift" && entriesFor(dayIdFor(priorDate)).length > 0;
     return `<section class="day rest${today ? " today" : ""}" data-day="${esc(date)}">
       ${head}
       <div class="day-rest-body">
         <span class="txt">Nothing planned.</span>
+        ${canCopy ? `<button class="small" data-copy-day="${esc(date)}"
+            title="Copy ${esc(fmtDate(priorDate))}">↺ Copy last week</button>` : ""}
         <button class="small" data-make-lift="${esc(date)}">＋ Lift day</button>
       </div></section>`;
   }
@@ -1446,6 +1472,9 @@ function wireWeek() {
   });
   $$("[data-make-lift]").forEach((el) => {
     el.onclick = () => setDayType(el.dataset.makeLift, "lift");
+  });
+  $$("[data-copy-day]").forEach((el) => {
+    el.onclick = () => openCopyDay(el.dataset.copyDay);
   });
   $$("[data-toggle-entry]").forEach((el) => {
     const id = el.dataset.toggleEntry;
@@ -1658,6 +1687,129 @@ function commitAddExercise() {
   const { date, exerciseId } = addDraft;
   closeAddExercise();
   addExercise(date, exerciseId, { ...addDraft });
+}
+
+// ---- Copy-day dialog ---------------------------------------------------------
+// "Copy last week" reuses addExercise() underneath, one call per exercise brought over
+// -- it is not a snapshot of last week's sets. That means weight still comes from
+// suggestWeight()'s own rule (whatever you last did for that movement), which for a
+// fresh day will usually resolve right back to the week this dialog is reading from --
+// the same number copying it by hand would have landed on, not a frozen duplicate of it.
+const copyDraft = { date: null, sourceDate: null, rows: [] };
+
+function openCopyDay(date) {
+  const sourceDate = addDays(date, -7);
+  const sourceDay = dayFor(sourceDate);
+  const entries = sourceDay ? entriesFor(sourceDay.id) : [];
+  if (!entries.length) return;
+  copyDraft.date = date;
+  copyDraft.sourceDate = sourceDate;
+  copyDraft.rows = entries.map((e) => {
+    const sets = setsFor(e.id);
+    const target = sets.map((s) => String(s.targetReps ?? "").trim()).find(Boolean);
+    return {
+      exerciseId: e.exerciseId,
+      name: e.name,
+      scheme: schemeOf(e),
+      sets: String(Math.max(1, Math.min(MAX_SCHEME_SETS, sets.length || 3))),
+      reps: target || String(DEFAULT_STATIC_REPS),
+      // A movement deleted from the library since last week has nothing left to add it
+      // as -- planSets() needs the library row for its unit and max weight -- so it's
+      // shown but can't be checked, rather than silently vanishing from the list.
+      include: !!exerciseById(e.exerciseId),
+    };
+  });
+  renderCopyDay();
+}
+
+function closeCopyDay() {
+  const modal = $("#copy-modal");
+  modal.hidden = true;
+  modal.innerHTML = "";
+}
+
+function copyRowHTML(row, i) {
+  const ex = exerciseById(row.exerciseId);
+  if (!ex) {
+    return `<div class="copy-row missing">
+      <input type="checkbox" disabled>
+      <span class="nm">${esc(row.name)}</span>
+      <span class="warn-note">no longer in the library</span>
+    </div>`;
+  }
+  const isPeak = row.scheme === "peak";
+  return `<div class="copy-row">
+    <label class="copy-row-head">
+      <input type="checkbox" data-copy-include="${i}" ${row.include ? "checked" : ""}>
+      <span class="nm">${esc(row.name)}</span>
+      ${isPeak ? '<span class="scheme">Peak</span>' : ""}
+    </label>
+    ${row.include && !isPeak ? `<span class="copy-row-fields">
+        <input type="text" inputmode="numeric" maxlength="1" data-copy-field="${i}:sets"
+               data-fkey="copy-sets:${i}" value="${esc(row.sets)}"> sets ×
+        <input type="text" inputmode="numeric" maxlength="2" data-copy-field="${i}:reps"
+               data-fkey="copy-reps:${i}" value="${esc(row.reps)}"> reps
+      </span>` : ""}
+  </div>`;
+}
+
+function renderCopyDay() {
+  if (!copyDraft.rows.length) return closeCopyDay();
+  const modal = $("#copy-modal");
+  const wasFocused = document.activeElement?.dataset?.copyField;
+  const caret = document.activeElement?.selectionStart;
+  const anyIncluded = copyDraft.rows.some((r) => r.include);
+
+  modal.hidden = false;
+  modal.innerHTML = `<div class="fb-box" style="width:min(440px,100%)">
+    <h3>Copy ${esc(fmtDate(copyDraft.sourceDate))}</h3>
+    <p style="font-size:.75rem;color:var(--muted);margin:.1rem 0 .5rem">
+      Into ${esc(fmtDate(copyDraft.date))}. Pick which exercises to bring over -- weight
+      starts from your last session with each, same as adding one by hand.</p>
+    <div class="copy-rows">${copyDraft.rows.map(copyRowHTML).join("")}</div>
+    <div class="fb-actions">
+      <button class="primary" id="copy-go"${anyIncluded ? "" : " disabled"}>Copy</button>
+      <button id="copy-cancel">Cancel</button>
+    </div>
+  </div>`;
+
+  $$("[data-copy-include]").forEach((el) => {
+    el.onchange = () => {
+      copyDraft.rows[+el.dataset.copyInclude].include = el.checked;
+      renderCopyDay();
+    };
+  });
+  $$("[data-copy-field]").forEach((el) => {
+    const [i, field] = el.dataset.copyField.split(":");
+    el.oninput = () => {
+      const clean = el.value.replace(/\D+/g, "");
+      if (clean !== el.value) el.value = clean;
+      copyDraft.rows[+i][field] = clean;
+      renderCopyDay();
+    };
+  });
+  $("#copy-cancel").onclick = closeCopyDay;
+  $("#copy-go").onclick = commitCopyDay;
+
+  if (wasFocused) {
+    const el = document.querySelector(`[data-copy-field="${CSS.escape(wasFocused)}"]`);
+    if (el) { el.focus(); try { el.setSelectionRange(caret, caret); } catch { /* no range */ } }
+  } else {
+    $("#copy-go").focus();
+  }
+}
+
+function commitCopyDay() {
+  const { date, rows } = copyDraft;
+  closeCopyDay();
+  // Sequential, not batched into one mutate(): mutate() applies each call's ops to
+  // state.doc before it awaits the network, so addExercise() calls made one after another
+  // here still see each prior one's entry when it works out order and suggestWeight() --
+  // the same as if they'd been added by hand, one at a time.
+  for (const row of rows) {
+    if (!row.include) continue;
+    addExercise(date, row.exerciseId, { scheme: row.scheme, sets: row.sets, reps: row.reps });
+  }
 }
 
 // ---- Library ---------------------------------------------------------------
@@ -2022,14 +2174,14 @@ function wireGlobal() {
   $("#btn-feedback").onclick = openFeedback;
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { closeFeedback(); closeAddExercise(); closeProgramSetup(); return; }
+    if (e.key === "Escape") { closeFeedback(); closeAddExercise(); closeProgramSetup(); closeCopyDay(); return; }
     // Shortcuts must never fire while someone is typing a weight into a box, or while a
     // dialog is up -- "f" over the add-exercise dialog would stack the feedback form on
     // top of a decision that hasn't been taken yet.
     // matches?. rather than matches: a keydown with nothing focused targets the document,
     // which is not an Element and has no matches() to call.
     if (e.target.matches?.("input, select, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
-    if (!$("#add-modal").hidden || !$("#fb-modal").hidden || !$("#program-modal").hidden) return;
+    if (!$("#add-modal").hidden || !$("#fb-modal").hidden || !$("#program-modal").hidden || !$("#copy-modal").hidden) return;
     if (e.key === "f") { e.preventDefault(); openFeedback(); }
     else if (e.key === "[" && state.view === "week") shiftWeek(-1);
     else if (e.key === "]" && state.view === "week") shiftWeek(1);
